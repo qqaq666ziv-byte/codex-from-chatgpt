@@ -1,46 +1,126 @@
-# Codex Agent MCP V0.2
+# codex-from-chatgpt
 
-Puente MCP personal y monousuario para delegar tareas a la instalación local
-de Codex. La frontera del producto es deliberadamente pequeña:
+Usa Codex local desde ChatGPT. Este proyecto es un puente MCP personal y
+monousuario: ChatGPT envía una instrucción, el servicio local la traduce a un
+thread de `codex app-server --stdio` y devuelve un resumen compacto del
+trabajo de Codex.
+
+> **Proyecto comunitario y no oficial:** no es una integración oficial de
+> OpenAI ni de ChatGPT.
+
+La frontera del producto es deliberadamente pequeña:
 
 ```text
-ChatGPT web
-  -> Secure MCP Tunnel
+ChatGPT (a través de un Secure MCP Tunnel)
   -> MCP Streamable HTTP (/mcp)
   -> API compacta de jobs
   -> codex app-server --stdio (JSONL)
   -> Codex local
 ```
 
-Este proyecto no usa `codex mcp-server`, no expone shell ni filesystem como
-tools MCP y no implementa broker, worker farm, multiagente ni almacenamiento
-externo.
+No usa `codex mcp-server`, no expone shell ni filesystem como tools MCP y no
+implementa broker, worker farm, multiagente ni almacenamiento externo.
 
-## Requisitos y ejecución
+La documentación oficial de OpenAI describe [MCP](https://learn.chatgpt.com/docs/extend/mcp)
+y [Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels).
+Para los detalles del protocolo subyacente, consulta la referencia de
+[Codex App Server](https://learn.chatgpt.com/docs/app-server).
+
+## Requisitos
 
 - Node.js 20 o posterior.
-- `codex-cli 0.147.0` en `PATH`, instalado y autenticado localmente.
+- `codex-cli 0.147.0` en `PATH`.
+- Codex instalado y autenticado localmente.
+- Un workspace existente bajo la raíz administrativa permitida. Los ejemplos
+  usan `/Users/you/workspace`; se puede cambiar con
+  `CODEX_WORKSPACE_ROOT`.
+
+Comprueba la instalación local antes de conectar ChatGPT:
+
+```bash
+codex --version
+```
+
+## Instalar y ejecutar
+
+Desde la copia local del repositorio:
 
 ```bash
 npm install
-npm run typecheck
-npm test
 npm run build
 npm start
 ```
 
-El servicio escucha por defecto en `http://127.0.0.1:8787`:
+El proceso escucha por defecto sólo en loopback:
 
 - MCP: `http://127.0.0.1:8787/mcp`
 - salud: `http://127.0.0.1:8787/healthz`
 - readiness: `http://127.0.0.1:8787/readyz`
 
-El smoke test del cliente app-server contra el binario instalado puede
-ejecutarse después del build con:
+Verifica que el servicio y el app-server estén listos:
 
 ```bash
-node --input-type=module -e 'import { CodexAppServer } from "./dist/src/codex-app-server.js"; void (async () => { const c = new CodexAppServer(); await c.start(); console.log(c.isReady()); console.log(await c.request("thread/list", { limit: 1, useStateDbOnly: true })); await c.stop(); })();'
+curl -fsS http://127.0.0.1:8787/healthz
+curl -fsS http://127.0.0.1:8787/readyz
 ```
+
+Para usar otra raíz administrativa o puerto:
+
+```bash
+CODEX_WORKSPACE_ROOT=/ruta/absoluta/a/workspaces PORT=8787 npm start
+```
+
+## Conexión paso a paso desde ChatGPT
+
+ChatGPT no se conecta directamente a `127.0.0.1`. El único camino documentado
+desde ChatGPT hacia este servicio local es:
+
+```text
+ChatGPT
+  -> URL HTTPS del Secure MCP Tunnel
+  -> http://127.0.0.1:8787/mcp (upstream local del túnel)
+  -> codex-from-chatgpt
+  -> codex app-server --stdio
+```
+
+1. Instala, construye e inicia `codex-from-chatgpt` con `npm start` y deja el
+   proceso local abierto.
+2. Confirma localmente `/healthz` y `/readyz`.
+3. Configura un **Secure MCP Tunnel** para reenviar una ruta HTTPS protegida
+   hacia `http://127.0.0.1:8787/mcp`. El túnel debe exigir autenticación y
+   controles de acceso; no publiques directamente el puerto `8787`.
+4. Conecta ChatGPT usando la URL HTTPS del túnel en el mecanismo de MCP remoto
+   disponible para tu cuenta o workspace. No uses la URL `127.0.0.1` en
+   ChatGPT.
+5. Comprueba que el servidor exponga las tools
+   `codex_start`, `codex_get`, `codex_continue`, `codex_interrupt` y
+   `codex_respond_approval`.
+6. Prueba una tarea con un workspace absoluto permitido, por ejemplo:
+
+   ```text
+   Usa codex_start en el workspace "/Users/you/workspace/mi-proyecto"
+   para inspeccionar el estado de Git sin modificar archivos. Devuélveme el
+   job_id y luego consulta el resultado con codex_get.
+   ```
+
+El flujo normal es:
+
+1. `codex_start` crea el thread persistente y comienza el primer turn.
+2. `codex_get` consulta el snapshot compacto del job.
+3. Si el turno termina, `codex_continue` envía la siguiente instrucción al
+   mismo thread.
+4. Si Codex solicita una aprobación, `codex_respond_approval` responde usando
+   el `request_id` exacto que aparece en `pending_approvals`.
+5. `codex_interrupt` detiene un turno activo cuando sea necesario.
+
+> **Disponibilidad actual:** el MCP completo, especialmente las write actions,
+> depende del plan, la cuenta, el workspace y las capacidades habilitadas de
+> ChatGPT. Este proyecto no promete soporte universal; sólo estarán disponibles
+> las capacidades que exponga el entorno de ChatGPT conectado.
+
+El túnel no forma parte de este repositorio. El bind no loopback requiere el
+opt-in explícito `CODEX_AGENT_ALLOW_NON_LOOPBACK=1` y sólo debe usarse cuando
+el túnel cubra todo el transporte.
 
 ## Tools MCP
 
@@ -52,29 +132,23 @@ La superficie pública es exactamente esta:
 | `codex_get` | `{ job_id: string }` | Devuelve un resumen compacto del job. |
 | `codex_continue` | `{ job_id: string, prompt: string }` | Reutiliza el mismo thread y crea otro turn cuando el anterior terminó. |
 | `codex_interrupt` | `{ job_id: string }` | Ejecuta `turn/interrupt` sobre el turn activo. |
-| `codex_respond_approval` | `{ job_id: string, request_id: string | number, decision: ... }` | Responde una approval concreta del app-server. |
-
-`decision` sólo admite los valores/objetos del protocolo Codex 0.147.0 para
-command execution, file changes, permissions y las approvals legacy del mismo
-protocolo. `request_id` es obligatorio:
-dos approvals pendientes pueden coexistir y nunca se responde una por
-posición o por “la última recibida”.
+| `codex_respond_approval` | `{ job_id: string, request_id: string \| number, decision: ... }` | Responde una aprobación concreta del app-server. |
 
 `codex_get` entrega `status`, `job_id`, `thread_id`, `turn_id`,
 `final_message`, `latest_diff`, `files_changed`, `commands_executed`, `error`,
 `pending_approvals` y, por compatibilidad, `pending_approval` como alias de la
-primera approval. No devuelve el stream JSONL crudo.
+primera aprobación. No devuelve el stream JSONL crudo.
 
-## Lifecycle y concurrencia
+Las aprobaciones aceptan únicamente los valores y objetos definidos por el
+protocolo instalado para command execution, file changes, permissions y las
+aprobaciones legacy. `request_id` es obligatorio: dos aprobaciones pendientes
+pueden coexistir y nunca se responde una por posición o por “la última
+recibida”.
+
+## Lifecycle, persistencia y recuperación
 
 Los estados son `starting`, `running`, `awaiting_approval`, `interrupting`,
 `completed`, `interrupted`, `failed` y `recovery_required`.
-
-Un turn sólo termina con una respuesta terminal de `turn/start` o una
-notificación `turn/completed` del mismo `threadId` y `turnId`. No se usa
-`thread/status: idle` como heurística. Si una notificación llega antes de que
-`turn/start` devuelva el `turnId`, queda bufferizada y se aplica después sólo si
-corresponde a ese turn.
 
 V0.2 permite un único turn activo por proceso/app-server. Un `start` o
 `continue` concurrente devuelve un error semántico de backend ocupado;
@@ -82,104 +156,101 @@ V0.2 permite un único turn activo por proceso/app-server. Un `start` o
 timeout cuyo resultado sea incierto deja el job en `recovery_required`, nunca
 en `completed` inventado.
 
-## Persistencia y recuperación
+El índice mínimo `job_id → thread_id`, workspace, último turn y resumen se
+guarda atómicamente en un archivo local. Su ubicación se puede definir con
+`CODEX_AGENT_STATE_FILE`; el contenido puede incluir mensajes finales, diffs,
+archivos, comandos y errores, por lo que debe tratarse como información
+potencialmente sensible.
 
-El índice mínimo `job_id -> thread_id`, workspace, último turn y resumen se
-guarda atómicamente en:
+Al inicializar el app-server, los jobs persistidos se rehidratan mediante
+`thread/read` y, cuando corresponde, `thread/resume`. Si no se puede probar el
+estado, el job queda en `recovery_required`; no se convierte silenciosamente
+en `completed`.
 
-```text
-~/.codex-agent-mcp/state.json
-```
+## Seguridad y límites
 
-Se puede cambiar sólo como configuración administrativa local con
-`CODEX_AGENT_STATE_FILE`. El state puede contener `final_message`, diff,
-archivos, comandos y mensajes de error, por lo que debe tratarse como
-información potencialmente sensible. No guarda prompts completos, logs ni el
-historial de Codex. Las escrituras son temp-file + rename y el archivo queda
-con permisos `0600`. Un JSON corrupto o ambiguo (por ejemplo, `job_id` o
-`thread_id` duplicados) no tumba el servicio: se rechaza completo con
-diagnóstico en stderr y el servicio arranca con un índice vacío.
+- El servicio enlaza a `127.0.0.1` por defecto.
+- El workspace debe ser absoluto, existente y estar bajo la raíz permitida.
+- Se rechazan NUL, segmentos `..`, raíces inválidas y escapes por symlink
+  después de `realpath`.
+- El cliente remoto no puede elegir arbitrariamente `config`, modelo,
+  sandbox ni permisos; los overrides de entorno son administrativos del
+  proceso local.
+- Las tools de cambios no son read-only. Revisa las aprobaciones de Codex
+  antes de aceptar comandos, cambios de archivos o permisos.
 
-Al inicializar el app-server, los jobs se rehidratan mediante `thread/read` con
-turns y, si el último turn sigue `inProgress`, `thread/resume`. El historial
-canónico continúa siendo el de Codex. Si no se puede probar el estado, el job
-queda `recovery_required`; un job `running` persistido no se transforma
-silenciosamente en `completed`. Tras un crash/timeout, un `recovery_required`
-con thread y turn conocidos sólo vuelve a `running` si `thread/read` prueba que
-ese mismo turn está `inProgress` y `thread/resume` devuelve ese mismo thread y
-turn todavía `inProgress`. Si hay más de un recovery potencialmente activo,
-se aplica un fence global y no se aceptan nuevos `start`/`continue`.
-
-Si `thread/start` vence antes de devolver su id, el job queda persistido con
-`thread_id: null` y `recovery_required`. V0.2 no intenta adivinar qué thread
-creó usando preview, timestamps u otras heurísticas; el backend queda
-bloqueado y conserva el diagnóstico para revisión manual. No existe un tool
-`attach` ni una adopción automática de ese thread incierto.
-
-## Configuración y seguridad
-
-Variables administrativas locales:
+## Configuración administrativa
 
 - `HOST` y `PORT`: por defecto `127.0.0.1:8787`.
-- `CODEX_AGENT_ALLOW_NON_LOOPBACK=1`: opt-in explícito requerido para bind no
-  loopback. No se recomienda cuando el único transporte previsto es Secure MCP
-  Tunnel.
-- `CODEX_BIN`: binario local, por defecto `codex`.
-- `CODEX_RPC_TIMEOUT_MS`: timeout genérico de RPC, por defecto 30 000 ms.
-- `CODEX_SHUTDOWN_TIMEOUT_MS`: espera graceful, por defecto 2 000 ms.
-- `CODEX_AGENT_STATE_FILE`: ubicación local opcional del state JSON.
+- `CODEX_AGENT_ALLOW_NON_LOOPBACK=1`: permite un bind no loopback sólo con una
+  protección externa equivalente.
+- `CODEX_BIN`: binario local; por defecto `codex`.
+- `CODEX_RPC_TIMEOUT_MS`: timeout genérico de RPC; por defecto `30 000` ms.
+- `CODEX_SHUTDOWN_TIMEOUT_MS`: espera graceful; por defecto `2 000` ms.
+- `CODEX_AGENT_STATE_FILE`: ubicación opcional del state JSON.
 - `CODEX_WORKSPACE_ROOT`: raíz administrativa opcional; por defecto
-  `/Users/joseanu/workspace`.
+  `/Users/you/workspace` en los ejemplos de esta guía.
 - `CODEX_AGENT_MODEL` y `CODEX_AGENT_REASONING_EFFORT`: overrides locales
-  opcionales. Si no se definen, Codex usa su configuración local.
-
-Sin `CODEX_AGENT_ALLOW_NON_LOOPBACK=1`, cualquier `HOST` externo falla closed
-antes de escuchar. Si se habilita, el operador debe garantizar una protección
-equivalente (por ejemplo Secure MCP Tunnel con controles de acceso); este
-servidor no añade autenticación HTTP propia.
-
-El workspace debe ser absoluto, existente y un directorio. Se rechazan NUL,
-segmentos `..`, raíces inválidas y escapes por symlink después de canonicalizar
-con `realpath`. Sólo se pasa a Codex la ruta canónica bajo la raíz allowlist.
-El cliente remoto no puede elegir `config`, modelo, sandbox ni permisos
-arbitrarios; los overrides de entorno son administrativos del proceso local.
+  opcionales; si no se definen, Codex usa su configuración local.
 
 ## Compatibilidad del protocolo
 
-La implementación está fijada contra el protocolo observado de `codex-cli
-0.147.0`, app-server v2. El binario instalado es la autoridad: `main` de
-OpenAI/Codex puede cambiar independientemente del CLI local. El cliente usa
-`initialize` → `initialized`, JSONL bidireccional y soporta los RPC necesarios
-`thread/start`, `thread/resume`, `thread/list`, `thread/read`, `turn/start` y
-`turn/interrupt`, además de las approvals server-initiated soportadas.
+La implementación está fijada contra el protocolo observado de
+`codex-cli 0.147.0`, app-server v2. El binario instalado es la autoridad:
+OpenAI/Codex puede cambiar independientemente del CLI local.
 
-Los bindings TypeScript generados en
-`protocol/codex-0.147.0-ts/` sólo aportan type-safety durante el build; no se
-cargan en runtime. Los JSON schemas en
+El cliente usa `initialize` → `initialized`, JSONL bidireccional y los RPC
+necesarios `thread/start`, `thread/resume`, `thread/list`, `thread/read`,
+`turn/start` y `turn/interrupt`, además de las aprobaciones iniciadas por el
+servidor.
+
+Los bindings TypeScript generados en `protocol/codex-0.147.0-ts/` sólo aportan
+type-safety durante el build. Los JSON schemas en
 `protocol/codex-0.147.0-json-schema/` son referencia versionada y tampoco
-forman parte del runtime. Para actualizar el pin, instala/verifica el nuevo
-CLI y regenera ambos conjuntos con:
+forman parte del runtime. Para actualizar el pin, instala y verifica el nuevo
+CLI y regenera ambos conjuntos:
 
 ```bash
 codex app-server generate-ts --out protocol/codex-<version>-ts
 codex app-server generate-json-schema --out protocol/codex-<version>-json-schema
 ```
 
-Después hay que revisar imports, approvals y tests contra el binario instalado.
+Después hay que revisar imports, aprobaciones y tests contra el binario
+instalado.
 
-La regresión completa se ejecuta con `npm test`; incluye fakes sin sleeps
-largos y una integración opcional contra el binario instalado:
+## Validación local
+
+```bash
+npm run typecheck
+npm test
+npm run build
+git diff --check
+```
+
+La integración opcional contra el binario instalado se ejecuta así:
 
 ```bash
 CODEX_REAL_APP_SERVER=1 npm test -- --test-name-pattern='installed codex'
 ```
 
-También son válidos `npm run typecheck`, `npm run build` y `git diff --check`.
+## Built using itself
 
-## Referencia de diseño
+`codex-from-chatgpt` se construyó y validó usando el mismo circuito que
+expone: ChatGPT coordinó tareas mediante MCP, el puente creó threads de
+Codex local y el app-server devolvió snapshots para revisar el resultado. El
+flujo se usó para la implementación, follow-ups, revisiones independientes y
+para responder approvals de Codex.
 
-Se revisaron los patrones de lifecycle, rechazo de RPC pendientes, respuesta
-JSON-RPC a server requests no soportados, captura de turn y estado persistido de
-`openai/codex-plugin-cc`. Se reimplementaron en TypeScript sólo las invariantes
-útiles para este puente; no se copió la integración de Claude Code ni su
-arquitectura de jobs/logs.
+Ese flujo sirve también para mantener el proyecto:
+
+1. Usa `codex_start` para investigar una modificación y sus riesgos.
+2. Usa `codex_continue` para implementar o corregir una parte concreta.
+3. Usa `codex_get` para revisar diff, archivos, comandos, errores y
+   aprobaciones pendientes.
+4. Usa `codex_respond_approval` para responder approvals concretas mediante su
+   `request_id` exacto.
+5. Ejecuta revisiones independientes y después `npm run typecheck`, `npm test`
+   y `git diff --check` antes de dar por terminado el cambio.
+
+La idea es que el puente sea a la vez la herramienta de desarrollo y el
+artefacto que documenta cómo se utiliza.

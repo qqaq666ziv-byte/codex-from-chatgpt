@@ -1,4 +1,8 @@
 node_modules/
 dist/
+build/
+.env
+logs/
+.codex-agent-mcp/
 .DS_Store
 *.log

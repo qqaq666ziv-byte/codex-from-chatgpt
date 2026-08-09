@@ -7,13 +7,13 @@ import test from "node:test";
 import { validateWorkspace } from "../src/workspaces.js";
 
 test("canonical workspace stays under the configured root", async () => {
-  const result = await validateWorkspace("/Users/joseanu/workspace/codex-agent-mcp");
-  assert.equal(result, "/Users/joseanu/workspace/codex-agent-mcp");
+  const result = await validateWorkspace(process.cwd());
+  assert.equal(result, process.cwd());
 });
 
 test("workspace traversal, outside path and invalid root are rejected", async () => {
-  await assert.rejects(validateWorkspace("/Users/joseanu/workspace/../.codex"), /segmentos '\.\.'/);
-  await assert.rejects(validateWorkspace("/tmp"), /dentro de \/Users\/joseanu\/workspace/);
+  await assert.rejects(validateWorkspace(`${process.cwd()}/../.codex`), /segmentos '\.\.'/);
+  await assert.rejects(validateWorkspace("/tmp"), /dentro de .*workspace/);
   await assert.rejects(validateWorkspace("/tmp", "/path/../unsafe"), /segmentos '\.\.'/);
 });
 

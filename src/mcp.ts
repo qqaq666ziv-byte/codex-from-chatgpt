@@ -96,7 +96,7 @@ export function createMcpServer(manager: JobManager): McpServer {
       description:
         "Crea un thread persistente de Codex en un workspace local permitido y comienza un turn. No expone shell ni filesystem al cliente MCP.",
       inputSchema: {
-        workspace: z.string().min(1).describe("Ruta absoluta bajo /Users/joseanu/workspace."),
+        workspace: z.string().min(1).describe("Ruta absoluta bajo la raíz administrativa configurada."),
         prompt: z.string().min(1).describe("Instrucción para Codex."),
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },

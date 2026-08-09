@@ -1,7 +1,8 @@
 import { realpath, stat } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 
-export const DEFAULT_WORKSPACE_ROOT = "/Users/joseanu/workspace";
+export const DEFAULT_WORKSPACE_ROOT = path.join(os.homedir(), "workspace");
 export const WORKSPACE_ROOT = DEFAULT_WORKSPACE_ROOT;
 
 export class WorkspaceValidationError extends Error {

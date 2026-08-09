@@ -1,8 +1,8 @@
 {
-  "name": "codex-agent-mcp",
+  "name": "codex-from-chatgpt",
   "version": "0.2.0",
   "private": true,
-  "description": "Personal MCP bridge from ChatGPT to a local Codex app-server",
+  "description": "Personal MCP bridge for using local Codex from ChatGPT",
   "type": "module",
   "engines": {
     "node": ">=20"

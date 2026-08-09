@@ -9,7 +9,7 @@ import { AppServerError, CodexAppServer } from "../src/codex-app-server.js";
 import { JobManager } from "../src/jobs.js";
 import { StateStore } from "../src/store.js";
 
-const workspace = "/Users/joseanu/workspace/codex-agent-mcp";
+const workspace = process.cwd();
 
 class FakeAppServer implements AppServerClient {
   readonly requests: Array<{ method: string; params: unknown }> = [];

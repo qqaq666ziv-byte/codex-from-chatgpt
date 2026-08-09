@@ -10,7 +10,7 @@ function stateJob(jobId: string, threadId: string | null) {
   return {
     job_id: jobId,
     thread_id: threadId,
-    workspace: "/Users/joseanu/workspace/codex-agent-mcp",
+    workspace: process.cwd(),
     turn_id: null,
     status: "completed",
     final_message: null,
