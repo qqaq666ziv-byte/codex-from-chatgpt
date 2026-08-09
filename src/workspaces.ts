@@ -1,7 +1,8 @@
-import { realpath } from "node:fs/promises";
+import { realpath, stat } from "node:fs/promises";
 import path from "node:path";
 
-export const WORKSPACE_ROOT = "/Users/joseanu/workspace";
+export const DEFAULT_WORKSPACE_ROOT = "/Users/joseanu/workspace";
+export const WORKSPACE_ROOT = DEFAULT_WORKSPACE_ROOT;
 
 export class WorkspaceValidationError extends Error {
   constructor(message: string) {
@@ -10,51 +11,44 @@ export class WorkspaceValidationError extends Error {
   }
 }
 
-/**
- * Resolves a user-provided workspace to an existing canonical path under the
- * one local root this personal server is allowed to expose.
- */
-export async function validateWorkspace(input: string): Promise<string> {
+function configuredRoot(root = process.env.CODEX_WORKSPACE_ROOT ?? DEFAULT_WORKSPACE_ROOT): string {
+  if (!path.isAbsolute(root) || root.includes("\0") || root.split(path.sep).some((part) => part === "..")) {
+    throw new WorkspaceValidationError("CODEX_WORKSPACE_ROOT debe ser una ruta absoluta sin segmentos '..'.");
+  }
+  return root;
+}
+
+/** Resolves an existing directory under the canonical, administrative workspace root. */
+export async function validateWorkspace(input: string, rootInput?: string): Promise<string> {
   if (typeof input !== "string" || input.length === 0) {
     throw new WorkspaceValidationError("workspace debe ser una ruta no vacía.");
   }
-
   if (input.includes("\0")) {
     throw new WorkspaceValidationError("workspace contiene un byte NUL inválido.");
   }
-
   if (!path.isAbsolute(input)) {
     throw new WorkspaceValidationError("workspace debe ser una ruta absoluta.");
   }
-
-  // Reject traversal explicitly even when it would normalize back inside the
-  // root. This keeps the boundary obvious in audit logs and error messages.
   if (input.split(path.sep).some((part) => part === "..")) {
     throw new WorkspaceValidationError("workspace no puede contener segmentos '..'.");
   }
 
+  const rootInputValue = configuredRoot(rootInput);
   let root: string;
   let candidate: string;
   try {
-    root = await realpath(WORKSPACE_ROOT);
+    root = await realpath(rootInputValue);
+    if (!(await stat(root)).isDirectory()) throw new Error("la raíz no es un directorio");
     candidate = await realpath(path.resolve(input));
+    if (!(await stat(candidate)).isDirectory()) throw new Error("el workspace no es un directorio");
   } catch {
-    throw new WorkspaceValidationError(
-      `workspace no existe o no puede resolverse: ${input}`,
-    );
+    throw new WorkspaceValidationError(`workspace no existe o no puede resolverse: ${input}`);
   }
 
   const relative = path.relative(root, candidate);
-  const escapesRoot =
-    relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative);
-
+  const escapesRoot = relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative);
   if (escapesRoot) {
-    throw new WorkspaceValidationError(
-      `workspace debe estar dentro de ${WORKSPACE_ROOT}: ${input}`,
-    );
+    throw new WorkspaceValidationError(`workspace debe estar dentro de ${rootInputValue}: ${input}`);
   }
-
-  // Passing the canonical path to Codex means a symlink cannot redirect the
-  // cwd outside the allowed root between validation and thread/start.
   return candidate;
 }

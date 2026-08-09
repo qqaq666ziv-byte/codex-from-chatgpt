@@ -15,29 +15,54 @@ const networkAmendmentSchema = z.object({
     network_policy_amendment: z.object({
       host: z.string(),
       action: z.enum(["allow", "deny"]),
-    }),
+    }).strict(),
+  }).strict(),
+});
+const fileSystemPathSchema = z.union([
+  z.object({ type: z.literal("path"), path: z.string() }),
+  z.object({ type: z.literal("glob_pattern"), pattern: z.string() }),
+  z.object({
+    type: z.literal("special"),
+    value: z.union([
+      z.object({ kind: z.literal("root") }),
+      z.object({ kind: z.literal("minimal") }),
+      z.object({ kind: z.literal("project_roots"), subpath: z.string().nullable().optional() }),
+      z.object({ kind: z.literal("tmpdir") }),
+      z.object({ kind: z.literal("slash_tmp") }),
+      z.object({ kind: z.literal("unknown"), path: z.string(), subpath: z.string().nullable().optional() }),
+    ]),
   }),
+]);
+const fileSystemEntrySchema = z.object({
+  path: fileSystemPathSchema,
+  access: z.enum(["read", "write", "deny"]),
+});
+const additionalFileSystemPermissionsSchema = z.object({
+  read: z.array(z.string()).nullable().optional(),
+  write: z.array(z.string()).nullable().optional(),
+  globScanMaxDepth: z.number().int().positive().nullable().optional(),
+  entries: z.array(fileSystemEntrySchema).nullable().optional(),
 });
 const permissionResponseSchema = z.object({
   permissions: z.object({
-    network: z.object({ enabled: z.boolean().nullable() }).optional(),
-    fileSystem: z
-      .object({
-        read: z.array(z.string()).nullable(),
-        write: z.array(z.string()).nullable(),
-        globScanMaxDepth: z.number().int().positive().optional(),
-        entries: z.array(z.record(z.string(), z.unknown())).optional(),
-      })
-      .optional(),
+    network: z.object({ enabled: z.boolean().nullable().optional() }).nullable().optional(),
+    fileSystem: additionalFileSystemPermissionsSchema.nullable().optional(),
   }),
-  scope: z.enum(["turn", "session"]),
-  strictAutoReview: z.boolean().optional(),
+  scope: z.enum(["turn", "session"]).default("turn"),
+  strictAutoReview: z.boolean().nullable().optional(),
 });
+const legacyApprovalDecisionSchema = z.union([
+  z.enum(["approved", "approved_for_session", "timed_out", "abort"]),
+  z.object({ approved_execpolicy_amendment: z.object({ proposed_execpolicy_amendment: z.array(z.string()) }) }),
+  z.object({ network_policy_amendment: z.object({ network_policy_amendment: z.object({ host: z.string(), action: z.enum(["allow", "deny"]) }) }) }),
+  z.object({ denied: z.object({ rejection: z.string() }) }),
+]);
 const approvalDecisionSchema = z.union([
   commonDecisionSchema,
   commandAmendmentSchema,
   networkAmendmentSchema,
   permissionResponseSchema,
+  legacyApprovalDecisionSchema,
 ]);
 
 function jsonText(value: unknown): string {
@@ -62,7 +87,7 @@ function failure(error: unknown) {
 }
 
 export function createMcpServer(manager: JobManager): McpServer {
-  const server = new McpServer({ name: "Codex Agent", version: "0.1.0" });
+  const server = new McpServer({ name: "Codex Agent", version: "0.2.0" });
 
   server.registerTool(
     "codex_start",
@@ -145,16 +170,17 @@ export function createMcpServer(manager: JobManager): McpServer {
     {
       title: "Respond to Codex approval",
       description:
-        "Responde una approval pendiente emitida por app-server. Las decisiones son únicamente las del schema generado por Codex 0.147.0.",
+        "Responde exactamente una approval pendiente emitida por app-server. request_id es obligatorio cuando coexisten varias approvals.",
       inputSchema: {
         job_id: z.string().min(1),
+        request_id: z.union([z.string().min(1), z.number().finite()]),
         decision: approvalDecisionSchema,
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
     },
-    async ({ job_id, decision }) => {
+    async ({ job_id, request_id, decision }) => {
       try {
-        return success(await manager.respondApproval(job_id, decision as ApprovalDecision));
+        return success(await manager.respondApproval(job_id, request_id, decision as ApprovalDecision));
       } catch (error) {
         return failure(error);
       }
