@@ -1,12 +1,43 @@
 # codex-from-chatgpt
 
-Use your local Codex from ChatGPT. This project is a personal, single-user MCP
-bridge: ChatGPT sends an instruction, the local service translates it into a
-`codex app-server --stdio` thread, and returns a compact summary of what Codex
-did.
+**Use ChatGPT as the architect and orchestrator, while your local Codex does the
+actual work on your machine.**
+
+A personal, single-user MCP bridge. ChatGPT sends an instruction, the local
+service turns it into a `codex app-server --stdio` thread, and returns a compact
+summary of what Codex did.
+
+## Why
+
+Codex is already good at doing the work. What it does not have is someone to
+decide *what* work to do, review the result, and push back. That is the part
+you normally do by hand, one prompt at a time.
+
+This bridge puts ChatGPT in that seat. It plans, delegates, reads the diff, and
+sends the next instruction — while every command and file change happens on
+your machine, in your real repository, under approvals you control.
+
+```text
+You: "Investigate this bug and fix it."
+
+ChatGPT
+  → starts a local Codex job
+  → reviews the result
+  → asks Codex for a correction
+  → starts an independent review
+  → handles approvals with you
+
+Codex works on your actual local repo.
+```
+
+> **Dogfooded:** v0.2 was developed using v0.1 — ChatGPT orchestrated local
+> Codex implementation and independent review through this MCP. See
+> [Built using itself](#built-using-itself).
 
 > **Community project, not official:** this is not an official OpenAI or
 > ChatGPT integration.
+
+## Architecture
 
 The product boundary is deliberately small:
 
@@ -19,13 +50,42 @@ ChatGPT (through a Secure MCP Tunnel)
 ```
 
 It does not use `codex mcp-server`, does not expose shell or filesystem as MCP
-tools, and implements no broker, worker farm, multi-agent orchestration, or
-external storage.
+tools, and implements no broker, worker farm, or external storage.
+
+It also does not implement its own multi-agent framework — and does not need
+one. ChatGPT can orchestrate multiple independent Codex jobs through the same
+five-tool API: one job implements, another reviews it, and ChatGPT arbitrates
+between them.
+
+## Built using itself
+
+`codex-from-chatgpt` was built and validated through the same loop it exposes:
+ChatGPT coordinated tasks over MCP, the bridge created local Codex threads, and
+the app-server returned snapshots to review the result. That loop was used for
+the implementation, follow-ups, independent reviews, and for answering Codex
+approvals.
+
+The same loop maintains it. Using the [five tools](#mcp-tools) described below:
+
+1. Use `codex_start` to investigate a change and its risks.
+2. Use `codex_continue` to implement or fix one concrete part.
+3. Use `codex_get` to review the diff, files, commands, errors, and pending
+   approvals.
+4. Use `codex_respond_approval` to answer specific approvals via their exact
+   `request_id`.
+5. Run independent reviews, then `npm run typecheck`, `npm test`, and
+   `git diff --check` before calling a change done.
+
+The idea is that the bridge is both the development tool and the artifact that
+documents how it is used.
 
 ## Requirements
 
 - Node.js 20 or later.
-- `codex-cli 0.147.0` on your `PATH`, installed and authenticated locally.
+- Codex CLI on your `PATH`, installed and authenticated locally. Tested against
+  **Codex CLI 0.147.0** (app-server v2); other versions may work, and the
+  installed binary is always the authority — see
+  [Protocol compatibility](#protocol-compatibility).
 - A workspace directory under the allowed administrative root. That root
   defaults to `~/workspace` and must exist:
 
@@ -360,28 +420,6 @@ The optional integration test against the installed binary:
 ```bash
 CODEX_REAL_APP_SERVER=1 npm test -- --test-name-pattern='installed codex'
 ```
-
-## Built using itself
-
-`codex-from-chatgpt` was built and validated through the same loop it exposes:
-ChatGPT coordinated tasks over MCP, the bridge created local Codex threads, and
-the app-server returned snapshots to review the result. That loop was used for
-the implementation, follow-ups, independent reviews, and for answering Codex
-approvals.
-
-It also works for maintaining the project:
-
-1. Use `codex_start` to investigate a change and its risks.
-2. Use `codex_continue` to implement or fix one concrete part.
-3. Use `codex_get` to review the diff, files, commands, errors, and pending
-   approvals.
-4. Use `codex_respond_approval` to answer specific approvals via their exact
-   `request_id`.
-5. Run independent reviews, then `npm run typecheck`, `npm test`, and
-   `git diff --check` before calling a change done.
-
-The idea is that the bridge is both the development tool and the artifact that
-documents how it is used.
 
 ## Documentation and sources
 
