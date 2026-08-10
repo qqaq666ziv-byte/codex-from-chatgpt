@@ -4,5 +4,9 @@ build/
 .env
 logs/
 .codex-agent-mcp/
+
+# Schemas generados: referencia, no los consume ni el runtime ni el build.
+# Se regeneran con `codex app-server generate-json-schema` (ver README).
+protocol/*-json-schema/
 .DS_Store
 *.log

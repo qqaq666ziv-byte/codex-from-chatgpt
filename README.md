@@ -31,9 +31,13 @@ Para los detalles del protocolo subyacente, consulta la referencia de
 - Node.js 20 o posterior.
 - `codex-cli 0.147.0` en `PATH`.
 - Codex instalado y autenticado localmente.
-- Un workspace existente bajo la raíz administrativa permitida. Los ejemplos
-  usan `/Users/you/workspace`; se puede cambiar con
-  `CODEX_WORKSPACE_ROOT`.
+- Un workspace existente bajo la raíz administrativa permitida. Por defecto esa
+  raíz es `~/workspace` (el `workspace` de tu home) y debe existir; se puede
+  cambiar con `CODEX_WORKSPACE_ROOT`. Si no existe, créala:
+
+  ```bash
+  mkdir -p ~/workspace
+  ```
 
 Comprueba la instalación local antes de conectar ChatGPT:
 
@@ -43,9 +47,9 @@ codex --version
 
 ## Instalar y ejecutar
 
-Desde la copia local del repositorio:
-
 ```bash
+git clone https://github.com/<usuario>/codex-from-chatgpt.git
+cd codex-from-chatgpt
 npm install
 npm run build
 npm start
@@ -170,6 +174,11 @@ en `completed`.
 ## Seguridad y límites
 
 - El servicio enlaza a `127.0.0.1` por defecto.
+- `/mcp` valida la cabecera `Host` contra el `HOST:PORT` configurado y responde
+  `403` a cualquier otro valor. Esto cierra el DNS rebinding: una web que el
+  usuario visite no puede resolver su propio dominio a `127.0.0.1` y hablar con
+  el servicio local. Si el túnel reescribe `Host`, añade su hostname con
+  `CODEX_AGENT_ALLOWED_HOSTS`.
 - El workspace debe ser absoluto, existente y estar bajo la raíz permitida.
 - Se rechazan NUL, segmentos `..`, raíces inválidas y escapes por symlink
   después de `realpath`.
@@ -184,12 +193,15 @@ en `completed`.
 - `HOST` y `PORT`: por defecto `127.0.0.1:8787`.
 - `CODEX_AGENT_ALLOW_NON_LOOPBACK=1`: permite un bind no loopback sólo con una
   protección externa equivalente.
+- `CODEX_AGENT_ALLOWED_HOSTS`: lista separada por comas de hostnames extra
+  aceptados en la cabecera `Host` de `/mcp`. Sólo es necesaria si el Secure MCP
+  Tunnel reenvía su propio `Host` en lugar del upstream loopback.
 - `CODEX_BIN`: binario local; por defecto `codex`.
 - `CODEX_RPC_TIMEOUT_MS`: timeout genérico de RPC; por defecto `30 000` ms.
 - `CODEX_SHUTDOWN_TIMEOUT_MS`: espera graceful; por defecto `2 000` ms.
 - `CODEX_AGENT_STATE_FILE`: ubicación opcional del state JSON.
 - `CODEX_WORKSPACE_ROOT`: raíz administrativa opcional; por defecto
-  `/Users/you/workspace` en los ejemplos de esta guía.
+  `~/workspace`. Debe ser una ruta absoluta existente.
 - `CODEX_AGENT_MODEL` y `CODEX_AGENT_REASONING_EFFORT`: overrides locales
   opcionales; si no se definen, Codex usa su configuración local.
 
@@ -204,15 +216,23 @@ necesarios `thread/start`, `thread/resume`, `thread/list`, `thread/read`,
 `turn/start` y `turn/interrupt`, además de las aprobaciones iniciadas por el
 servidor.
 
-Los bindings TypeScript generados en `protocol/codex-0.147.0-ts/` sólo aportan
-type-safety durante el build. Los JSON schemas en
-`protocol/codex-0.147.0-json-schema/` son referencia versionada y tampoco
-forman parte del runtime. Para actualizar el pin, instala y verifica el nuevo
-CLI y regenera ambos conjuntos:
+Los bindings TypeScript generados en `protocol/codex-0.147.0-ts/` están
+versionados porque el código los importa: aportan type-safety durante el build.
+
+Los JSON schemas **no** están versionados. No los consume ni el runtime ni el
+build, así que el repositorio no arrastra cientos de archivos derivados. Si los
+necesitas como referencia del protocolo, genéralos localmente contra el binario
+instalado:
+
+```bash
+codex app-server generate-json-schema --out protocol/codex-0.147.0-json-schema
+```
+
+Ese directorio está en `.gitignore`. Para actualizar el pin a otra versión,
+instala y verifica el nuevo CLI y regenera los bindings:
 
 ```bash
 codex app-server generate-ts --out protocol/codex-<version>-ts
-codex app-server generate-json-schema --out protocol/codex-<version>-json-schema
 ```
 
 Después hay que revisar imports, aprobaciones y tests contra el binario

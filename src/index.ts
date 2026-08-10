@@ -64,6 +64,8 @@ async function main(): Promise<void> {
         transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
           enableJsonResponse: true,
+          enableDnsRebindingProtection: true,
+          allowedHosts: config.allowedHosts,
           onsessioninitialized: (newSessionId) => { sessions.set(newSessionId, { transport, server }); },
         });
         transport.onclose = () => {

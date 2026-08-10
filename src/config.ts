@@ -33,9 +33,40 @@ export function assertSafeHost(host: string, allowNonLoopback = process.env.CODE
   }
 }
 
+/**
+ * Host headers accepted on /mcp. Anchors DNS rebinding protection to the configured
+ * bind address instead of a hardcoded port. A tunnel that rewrites Host must add its
+ * own hostname through CODEX_AGENT_ALLOWED_HOSTS.
+ */
+export function allowedHosts(host: string, port: number, env: NodeJS.ProcessEnv = process.env): string[] {
+  const hosts = new Set<string>();
+  const add = (name: string): void => {
+    const normalized = name.trim().toLowerCase();
+    if (normalized.length > 0) hosts.add(normalized);
+  };
+
+  const bracket = (name: string): string => (net.isIP(name) === 6 ? `[${name}]` : name);
+  add(`${bracket(host)}:${port}`);
+  if (isLoopbackHost(host)) {
+    add(`127.0.0.1:${port}`);
+    add(`localhost:${port}`);
+    add(`[::1]:${port}`);
+  }
+  // El SDK compara la cabecera Host cruda, sin normalizar. Host es
+  // case-insensitive, así que se aceptan ambas formas para no rechazar a un
+  // túnel que envíe su hostname con mayúsculas.
+  for (const extra of (env.CODEX_AGENT_ALLOWED_HOSTS ?? "").split(",")) {
+    add(extra);
+    const verbatim = extra.trim();
+    if (verbatim.length > 0) hosts.add(verbatim);
+  }
+  return [...hosts];
+}
+
 export function runtimeConfig(env: NodeJS.ProcessEnv = process.env): {
   host: string;
   port: number;
+  allowedHosts: string[];
   codexCommand: string;
   rpcTimeoutMs: number;
   shutdownTimeoutMs: number;
@@ -55,9 +86,11 @@ export function runtimeConfig(env: NodeJS.ProcessEnv = process.env): {
 
   const host = env.HOST ?? DEFAULT_HOST;
   assertSafeHost(host, env.CODEX_AGENT_ALLOW_NON_LOOPBACK === "1");
+  const port = parsePort(env.PORT ?? String(DEFAULT_PORT));
   return {
     host,
-    port: parsePort(env.PORT ?? String(DEFAULT_PORT)),
+    port,
+    allowedHosts: allowedHosts(host, port, env),
     codexCommand: env.CODEX_BIN ?? "codex",
     rpcTimeoutMs: parseDuration("CODEX_RPC_TIMEOUT_MS", 30_000),
     shutdownTimeoutMs: parseDuration("CODEX_SHUTDOWN_TIMEOUT_MS", 2_000),
