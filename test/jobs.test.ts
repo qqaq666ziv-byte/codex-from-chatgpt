@@ -146,6 +146,18 @@ test("since_revision devuelve un snapshot pequeño y sólo cambia con estado obs
   assert.equal(changed.activity, "Running build");
 });
 
+test("unchanged omite warnings ya conocidos pero conserva la forma mínima", async () => {
+  const { fake, manager } = managerFixture();
+  const started = await manager.start(workspace, "mantén warnings sin repetir");
+  fake.emit({ method: "warning", params: { threadId: "thread-1", warning: "Advertencia operativa" } });
+
+  const current = manager.get(started.job_id, { detail: "compact" });
+  assert.deepEqual(current.warnings, ["Advertencia operativa"]);
+
+  const unchanged = manager.get(started.job_id, { detail: "compact", since_revision: current.revision });
+  assert.deepEqual(unchanged, { status: "running", revision: current.revision, unchanged: true });
+});
+
 test("comandos exploratorios y diffs raw no avanzan la revision supervisory", async () => {
   const { fake, manager } = managerFixture();
   const started = await manager.start(workspace, "mantén el polling estable");

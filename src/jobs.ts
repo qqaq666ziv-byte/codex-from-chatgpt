@@ -1084,7 +1084,6 @@ export class JobManager {
       result.error = truncateText(job.error, MAX_ERROR_TEXT);
       if (job.error.length > MAX_ERROR_TEXT) result.error_truncated = true;
     }
-    if (job.warnings.length > 0) result.warnings = boundedList(job.warnings, 10).values;
     return result;
   }
 

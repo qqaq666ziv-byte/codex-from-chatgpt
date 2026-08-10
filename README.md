@@ -329,6 +329,13 @@ The revision is persisted per job and tracks supervisory/control-plane state.
 Debug-only command history and raw diff changes can update without advancing
 it.
 
+Recommended flow: save the revision from `codex_start`, poll with `compact` and
+`since_revision`, then when the job completes call `codex_get` with
+`detail: "standard"` and no cursor for the final handoff. The cursor means “I
+know this supervisory state”, not “I have seen this detail view”, so a standard
+request with the same revision may also be `unchanged`; unchanged responses omit
+already-known warnings, while pending approvals and errors remain visible.
+
 Every persistent thread also receives one short internal completion-handoff
 requirement automatically. It asks Codex's final response to state actions,
 files changed, validation and results, plus unresolved warnings or limitations;

@@ -87,7 +87,7 @@ function failure(error: unknown) {
 }
 
 export function createMcpServer(manager: JobManager): McpServer {
-  const server = new McpServer({ name: "Codex Agent", version: "0.3.0" });
+  const server = new McpServer({ name: "Codex Agent", version: "0.3.1" });
 
   server.registerTool(
     "codex_start",
