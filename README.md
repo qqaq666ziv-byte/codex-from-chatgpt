@@ -57,7 +57,7 @@ Each step below corresponds to one stage of that sequence.
 ## 1. Clone, install, run locally
 
 ```bash
-git clone https://github.com/<your-user>/codex-from-chatgpt.git
+git clone https://github.com/joseanu/codex-from-chatgpt.git
 cd codex-from-chatgpt
 npm install
 npm run build
