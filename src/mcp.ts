@@ -87,7 +87,7 @@ function failure(error: unknown) {
 }
 
 export function createMcpServer(manager: JobManager): McpServer {
-  const server = new McpServer({ name: "Codex Agent", version: "0.2.0" });
+  const server = new McpServer({ name: "Codex Agent", version: "0.3.0" });
 
   server.registerTool(
     "codex_start",
@@ -135,13 +135,17 @@ export function createMcpServer(manager: JobManager): McpServer {
     {
       title: "Get Codex task",
       description:
-        "Devuelve un resumen compacto del job: estado, thread/turn, respuesta final, diff, archivos, comandos relevantes, error y approval pendiente.",
-      inputSchema: { job_id: z.string().min(1) },
+        "Devuelve un snapshot compacto, estándar o de depuración del job. Usa since_revision para sondear sin reenviar historial.",
+      inputSchema: {
+        job_id: z.string().min(1),
+        detail: z.enum(["compact", "standard", "debug"]).optional().default("standard"),
+        since_revision: z.number().int().nonnegative().optional(),
+      },
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
     },
-    async ({ job_id }) => {
+    async ({ job_id, detail, since_revision }) => {
       try {
-        return success(manager.get(job_id));
+        return success(manager.get(job_id, { detail, since_revision }));
       } catch (error) {
         return failure(error);
       }

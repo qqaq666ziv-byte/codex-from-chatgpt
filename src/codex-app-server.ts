@@ -244,7 +244,7 @@ export class CodexAppServer implements AppServerClient {
 
     try {
       const initializeParams: InitializeParams = {
-        clientInfo: { name: "codex-agent-mcp", title: "Codex Agent", version: "0.2.0" },
+        clientInfo: { name: "codex-agent-mcp", title: "Codex Agent", version: "0.3.0" },
         capabilities: { experimentalApi: true, requestAttestation: false },
       };
       await this.request("initialize", initializeParams);

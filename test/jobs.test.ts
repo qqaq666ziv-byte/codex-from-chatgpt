@@ -6,7 +6,7 @@ import test from "node:test";
 
 import type { AppServerMessage, AppServerClient, JsonRpcId } from "../src/codex-app-server.js";
 import { AppServerError, CodexAppServer } from "../src/codex-app-server.js";
-import { JobManager } from "../src/jobs.js";
+import { COMPLETION_REPORT_MARKER, JobManager } from "../src/jobs.js";
 import { StateStore } from "../src/store.js";
 
 const workspace = process.cwd();
@@ -93,11 +93,227 @@ test("happy path start -> completed keeps a compact summary", async () => {
   fake.emit({ method: "item/completed", params: { threadId: "thread-1", turnId: "turn-1", item: { type: "commandExecution", id: "cmd-1", command: "pwd", status: "completed" } } });
   fake.emit({ method: "turn/diff/updated", params: { threadId: "thread-1", turnId: "turn-1", diff: "diff --git a/a b/a" } });
   completed(fake);
-  const snapshot = manager.get(started.job_id);
+  const snapshot = manager.get(started.job_id, { detail: "debug" });
   assert.equal(snapshot.status, "completed");
   assert.equal(snapshot.final_message, "resultado");
   assert.deepEqual(snapshot.commands_executed, ["pwd"]);
   assert.equal(snapshot.latest_diff, "diff --git a/a b/a");
+});
+
+test("codex_get detail modes keep standard supervisory data separate from debug data", async () => {
+  const { fake, manager } = managerFixture();
+  const started = await manager.start(workspace, "reporta el estado");
+  fake.emit({ method: "item/started", params: { threadId: "thread-1", turnId: "turn-1", item: { type: "commandExecution", id: "cmd-1", command: "rg -n TODO .", status: "inProgress" } } });
+  const compact = manager.get(started.job_id, { detail: "compact" });
+  const standard = manager.get(started.job_id);
+  assert.equal(compact.status, "running");
+  assert.equal(compact.activity, "Codex is working");
+  assert.equal(standard.activity, "Codex is working");
+  assert.equal("commands_executed" in standard, false);
+  assert.equal("latest_diff" in standard, false);
+
+  fake.emit({ method: "item/completed", params: { threadId: "thread-1", turnId: "turn-1", item: { type: "agentMessage", id: "final", text: "Hecho", phase: "final_answer" } } });
+  fake.emit({ method: "item/completed", params: { threadId: "thread-1", turnId: "turn-1", item: { type: "commandExecution", id: "cmd-2", command: "npm test", status: "completed", exitCode: 0 } } });
+  fake.emit({ method: "item/completed", params: { threadId: "thread-1", turnId: "turn-1", item: { type: "fileChange", id: "file-1", changes: [{ path: "src/a.ts" }] } } });
+  fake.emit({ method: "turn/diff/updated", params: { threadId: "thread-1", turnId: "turn-1", diff: "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n+new line\n-old line" } });
+  completed(fake);
+
+  const finalStandard = manager.get(started.job_id);
+  assert.equal(finalStandard.final_message, "Hecho");
+  assert.deepEqual(finalStandard.files_changed, ["src/a.ts"]);
+  assert.deepEqual(finalStandard.diffstat, { files: 1, insertions: 1, deletions: 1 });
+  assert.deepEqual(finalStandard.validation, [{ kind: "test", command: "npm test", status: "passed", exit_code: 0 }]);
+  assert.equal("commands_executed" in finalStandard, false);
+  assert.equal("latest_diff" in finalStandard, false);
+
+  const debug = manager.get(started.job_id, { detail: "debug" });
+  assert.deepEqual(debug.commands_executed, ["npm test"]);
+  assert.match(debug.latest_diff ?? "", /^diff --git/);
+});
+
+test("since_revision devuelve un snapshot pequeño y sólo cambia con estado observable", async () => {
+  const { fake, manager } = managerFixture();
+  const started = await manager.start(workspace, "sondeo");
+  const first = manager.get(started.job_id, { detail: "compact" });
+  const unchanged = manager.get(started.job_id, { detail: "compact", since_revision: first.revision });
+  assert.deepEqual(unchanged, { status: "running", revision: first.revision, unchanged: true });
+  assert.equal(manager.get(started.job_id, { detail: "compact" }).revision, first.revision);
+
+  fake.emit({ method: "item/started", params: { threadId: "thread-1", turnId: "turn-1", item: { type: "commandExecution", id: "cmd-1", command: "npm run build", status: "inProgress" } } });
+  const changed = manager.get(started.job_id, { detail: "compact", since_revision: first.revision });
+  assert.equal(changed.unchanged, undefined);
+  assert.ok(changed.revision > first.revision);
+  assert.equal(changed.activity, "Running build");
+});
+
+test("comandos exploratorios y diffs raw no avanzan la revision supervisory", async () => {
+  const { fake, manager } = managerFixture();
+  const started = await manager.start(workspace, "mantén el polling estable");
+  const baseline = manager.get(started.job_id, { detail: "compact" });
+  for (const [index, command] of ["rg -n TODO .", "sed -n '1,20p' README.md", "cat package.json"].entries()) {
+    fake.emit({ method: "item/started", params: { threadId: "thread-1", turnId: "turn-1", item: { type: "commandExecution", id: `explore-${index}`, command, status: "inProgress" } } });
+    fake.emit({ method: "item/completed", params: { threadId: "thread-1", turnId: "turn-1", item: { type: "commandExecution", id: `explore-${index}`, command, status: "completed", exitCode: 0 } } });
+  }
+  fake.emit({ method: "turn/diff/updated", params: { threadId: "thread-1", turnId: "turn-1", diff: "diff --git a/one b/one" } });
+  fake.emit({ method: "turn/diff/updated", params: { threadId: "thread-1", turnId: "turn-1", diff: "diff --git a/two b/two" } });
+  const compact = manager.get(started.job_id, { detail: "compact" });
+  assert.equal(compact.revision, baseline.revision);
+  assert.equal(compact.activity, "Codex is working");
+  const debug = manager.get(started.job_id, { detail: "debug" });
+  assert.deepEqual(debug.commands_executed, ["rg -n TODO .", "sed -n '1,20p' README.md", "cat package.json"]);
+  assert.equal(debug.latest_diff, "diff --git a/two b/two");
+});
+
+test("debug con since_revision igual devuelve los diagnosticos actuales", async () => {
+  const { fake, manager } = managerFixture();
+  const started = await manager.start(workspace, "diagnostico actual");
+  const current = manager.get(started.job_id, { detail: "compact" });
+
+  fake.emit({
+    method: "item/started",
+    params: {
+      threadId: "thread-1",
+      turnId: "turn-1",
+      item: { type: "commandExecution", id: "explore-debug", command: "rg -n TODO .", status: "inProgress" },
+    },
+  });
+  fake.emit({
+    method: "item/completed",
+    params: {
+      threadId: "thread-1",
+      turnId: "turn-1",
+      item: { type: "commandExecution", id: "explore-debug", command: "rg -n TODO .", status: "completed", exitCode: 0 },
+    },
+  });
+  fake.emit({
+    method: "turn/diff/updated",
+    params: { threadId: "thread-1", turnId: "turn-1", diff: "diff --git a/current b/current" },
+  });
+
+  const debug = manager.get(started.job_id, { detail: "debug", since_revision: current.revision });
+  assert.equal(debug.revision, current.revision);
+  assert.equal(debug.unchanged, undefined);
+  assert.deepEqual(debug.commands_executed, ["rg -n TODO ."]);
+  assert.equal(debug.latest_diff, "diff --git a/current b/current");
+});
+
+test("recognized validation activity and validation state advance revision", async () => {
+  const { fake, manager } = managerFixture();
+  const started = await manager.start(workspace, "observa validacion");
+  const baseline = manager.get(started.job_id, { detail: "compact" });
+  fake.emit({ method: "item/started", params: { threadId: "thread-1", turnId: "turn-1", item: { type: "commandExecution", id: "test", command: "npm test", status: "inProgress" } } });
+  const running = manager.get(started.job_id, { detail: "compact" });
+  assert.ok(running.revision > baseline.revision);
+  assert.equal(running.activity, "Running tests");
+  fake.emit({ method: "item/completed", params: { threadId: "thread-1", turnId: "turn-1", item: { type: "commandExecution", id: "test", command: "npm test", status: "completed", exitCode: 0 } } });
+  const completedValidation = manager.get(started.job_id, { detail: "compact" });
+  assert.ok(completedValidation.revision > running.revision);
+  assert.equal(completedValidation.activity, "Tests completed");
+});
+
+test("files, approvals, and terminal status are supervisory revision changes", async () => {
+  const { fake, manager } = managerFixture();
+  const started = await manager.start(workspace, "observa control");
+  const baseline = manager.get(started.job_id, { detail: "compact" });
+  fake.emit({ method: "item/completed", params: { threadId: "thread-1", turnId: "turn-1", item: { type: "fileChange", id: "file-1", changes: [{ path: "src/control.ts" }] } } });
+  const filesChanged = manager.get(started.job_id, { detail: "standard" });
+  assert.ok(filesChanged.revision > baseline.revision);
+  assert.deepEqual(filesChanged.files_changed, ["src/control.ts"]);
+  fake.emit({ id: 88, method: "item/commandExecution/requestApproval", params: { threadId: "thread-1", turnId: "turn-1", itemId: "item-88", command: "npm test" } });
+  const approval = manager.get(started.job_id, { detail: "compact" });
+  assert.ok(approval.revision > filesChanged.revision);
+  assert.equal(approval.pending_approval?.request_id, 88);
+  fake.emit({ method: "turn/completed", params: { threadId: "thread-1", turnId: "turn-1", turn: { id: "turn-1", status: "completed", items: [] } } });
+  const terminal = manager.get(started.job_id, { detail: "compact" });
+  assert.ok(terminal.revision > approval.revision);
+  assert.equal(terminal.status, "completed");
+});
+
+test("since_revision mayor que la revision actual falla claramente", async () => {
+  const { manager } = managerFixture();
+  const started = await manager.start(workspace, "valida el cursor");
+  const current = manager.get(started.job_id, { detail: "compact" });
+  assert.throws(
+    () => manager.get(started.job_id, { since_revision: current.revision + 1 }),
+    /since_revision .*no puede ser mayor que la revision actual/,
+  );
+  const older = manager.get(started.job_id, { since_revision: current.revision - 1 });
+  assert.equal(older.unchanged, undefined);
+});
+
+test("una approval pendiente se conserva incluso en polling unchanged", async () => {
+  const { fake, manager } = managerFixture();
+  const started = await manager.start(workspace, "pide aprobación");
+  fake.emit({ id: 77, method: "item/commandExecution/requestApproval", params: { threadId: "thread-1", turnId: "turn-1", itemId: "item-77", command: "npm test", cwd: workspace } });
+  const current = manager.get(started.job_id, { detail: "compact" });
+  assert.equal("command" in (current.pending_approval ?? {}), false);
+  const unchanged = manager.get(started.job_id, { detail: "compact", since_revision: current.revision });
+  assert.equal(unchanged.unchanged, true);
+  assert.equal(unchanged.pending_approval?.request_id, 77);
+  assert.equal(unchanged.pending_approval?.kind, "command_execution");
+  assert.match((unchanged.pending_approval as { summary?: string }).summary ?? "", /npm test/);
+});
+
+test("validation extraction is deterministic and excludes exploratory commands", async () => {
+  const { fake, manager } = managerFixture();
+  const started = await manager.start(workspace, "valida");
+  const items = [
+    { type: "commandExecution", id: "test", command: "npm test", status: "completed", exitCode: 0 },
+    { type: "commandExecution", id: "types", command: "npm run typecheck", status: "failed", exitCode: 2, aggregatedOutput: "Type error" },
+    { type: "commandExecution", id: "build", command: "npm run build", status: "completed" },
+    { type: "commandExecution", id: "lint", command: "npm run lint", status: "completed", exitCode: 0 },
+    { type: "commandExecution", id: "diff", command: "git diff --check", status: "completed", exitCode: 0 },
+    { type: "commandExecution", id: "http", command: "curl -fsS http://127.0.0.1:8787/readyz", status: "completed", exitCode: 0 },
+    { type: "commandExecution", id: "search", command: "rg -n TODO .", status: "completed", exitCode: 0 },
+  ];
+  for (const item of items) fake.emit({ method: "item/completed", params: { threadId: "thread-1", turnId: "turn-1", item } });
+  fake.emit({ method: "item/completed", params: { threadId: "thread-1", turnId: "turn-1", item: { type: "agentMessage", id: "final", text: "validado", phase: "final_answer" } } });
+  completed(fake);
+  const validation = manager.get(started.job_id).validation;
+  assert.deepEqual(validation?.map(({ kind, command, status, exit_code }) => ({ kind, command, status, exit_code })), [
+    { kind: "test", command: "npm test", status: "passed", exit_code: 0 },
+    { kind: "typecheck", command: "npm run typecheck", status: "failed", exit_code: 2 },
+    { kind: "build", command: "npm run build", status: "completed", exit_code: undefined },
+    { kind: "lint", command: "npm run lint", status: "passed", exit_code: 0 },
+    { kind: "diff_check", command: "git diff --check", status: "passed", exit_code: 0 },
+    { kind: "http_check", command: "curl -fsS http://127.0.0.1:8787/readyz", status: "passed", exit_code: 0 },
+  ]);
+});
+
+test("debug output is bounded without discarding the stored diagnostic state", async () => {
+  const { fake, manager, store } = managerFixture();
+  const started = await manager.start(workspace, "mucho diagnóstico");
+  for (let index = 0; index < 125; index += 1) {
+    fake.emit({ method: "item/completed", params: { threadId: "thread-1", turnId: "turn-1", item: { type: "commandExecution", id: `cmd-${index}`, command: `echo ${index}`, status: "completed", exitCode: 0 } } });
+  }
+  const largeDiff = `diff --git a/a b/a\n${"+line\n".repeat(5_000)}`;
+  fake.emit({ method: "turn/diff/updated", params: { threadId: "thread-1", turnId: "turn-1", diff: largeDiff } });
+  const debug = manager.get(started.job_id, { detail: "debug" });
+  assert.equal(debug.commands_executed?.length, 100);
+  assert.equal(debug.commands_truncated, true);
+  assert.equal(debug.latest_diff_truncated, true);
+  assert.ok((debug.latest_diff?.length ?? 0) < largeDiff.length);
+  assert.equal(store.load()[0]?.commands_executed.length, 125);
+  assert.equal(store.load()[0]?.latest_diff, largeDiff);
+});
+
+test("completion handoff is appended once while preserving the caller prompt", async () => {
+  const { fake, manager } = managerFixture();
+  const original = "Implement exactly this requested change.";
+  const started = await manager.start(workspace, original);
+  const firstTurn = fake.requests.find((request) => request.method === "turn/start");
+  const firstText = ((firstTurn?.params as { input: Array<{ text: string }> }).input[0]?.text) ?? "";
+  assert.ok(firstText.startsWith(original));
+  assert.equal(firstText.split(COMPLETION_REPORT_MARKER).length - 1, 1);
+  assert.match(firstText, /actions taken/);
+  assert.match(firstText, /validation performed and results/);
+  assert.match(firstText, /unresolved warnings or limitations/);
+  completed(fake);
+  await manager.continue(started.job_id, "Now verify the result.");
+  const turnStarts = fake.requests.filter((request) => request.method === "turn/start");
+  const secondText = ((turnStarts[1]?.params as { input: Array<{ text: string }> }).input[0]?.text) ?? "";
+  assert.equal(secondText, "Now verify the result.");
+  assert.equal(secondText.includes(COMPLETION_REPORT_MARKER), false);
 });
 
 test("terminal turn/start y turn/completed registran items antes de cerrar", async () => {
@@ -109,7 +325,7 @@ test("terminal turn/start y turn/completed registran items antes de cerrar", asy
     { type: "fileChange", id: "file", changes: [{ path: "src/a.ts" }] },
   ];
   const started = await manager.start(workspace, "terminal inmediato");
-  const snapshot = manager.get(started.job_id);
+  const snapshot = manager.get(started.job_id, { detail: "debug" });
   assert.equal(snapshot.status, "completed");
   assert.equal(snapshot.final_message, "terminado");
   assert.deepEqual(snapshot.commands_executed, ["npm test"]);
@@ -126,7 +342,7 @@ test("turn/completed terminal registra sus items antes de cerrar", async () => {
       { type: "fileChange", id: "file-event", changes: [{ path: "README.md" }] },
     ],
   } } });
-  const snapshot = manager.get(started.job_id);
+  const snapshot = manager.get(started.job_id, { detail: "debug" });
   assert.equal(snapshot.status, "completed");
   assert.equal(snapshot.final_message, "respuesta del evento");
   assert.deepEqual(snapshot.commands_executed, ["git diff"]);
@@ -229,9 +445,9 @@ test("permissions rechaza entries que no siguen el schema 0.147.0", async () => 
   const started = await manager.start(workspace, "permissions");
   fake.emit({ id: 20, method: "item/permissions/requestApproval", params: { threadId: "thread-1", turnId: "turn-1", itemId: "item-20" } });
   await assert.rejects(manager.respondApproval(started.job_id, 20, { permissions: { fileSystem: { entries: [{ arbitrary: true }] } }, scope: "turn" } as never), /decision no admitida/);
-  assert.equal(manager.get(started.job_id).pending_approvals.length, 1);
+  assert.equal(manager.get(started.job_id).pending_approvals?.length ?? 0, 1);
   await manager.respondApproval(started.job_id, 20, { permissions: { network: null, fileSystem: { entries: null, globScanMaxDepth: null } }, scope: "turn" });
-  assert.equal(manager.get(started.job_id).pending_approvals.length, 0);
+  assert.equal(manager.get(started.job_id).pending_approvals?.length ?? 0, 0);
   fake.emit({ id: 21, method: "item/permissions/requestApproval", params: { threadId: "thread-1", turnId: "turn-1", itemId: "item-21" } });
   const omittedScopeDecision = { permissions: {
     network: {},
@@ -241,7 +457,7 @@ test("permissions rechaza entries que no siguen el schema 0.147.0", async () => 
     ] },
   } } as never;
   await manager.respondApproval(started.job_id, 21, omittedScopeDecision);
-  assert.equal(manager.get(started.job_id).pending_approvals.length, 0);
+  assert.equal(manager.get(started.job_id).pending_approvals?.length ?? 0, 0);
 });
 
 test("un turno activo bloquea otro start y el app-server crash deja recovery_required", async () => {
@@ -298,10 +514,13 @@ test("state durable permite restart y rehidrata sin inventar completion", async 
   const { fake, manager, store } = managerFixture();
   const started = await manager.start(workspace, "persistente");
   completed(fake, "turn-1", "thread-1", [{ type: "agentMessage", id: "m", text: "persistido", phase: "final_answer" }]);
+  const persistedRevision = store.load()[0]?.revision;
+  assert.ok(persistedRevision !== undefined);
   const secondFake = new FakeAppServer();
   secondFake.readThread = { id: "thread-1", turns: [{ id: "turn-1", status: "completed", items: [{ type: "agentMessage", id: "m", text: "persistido", phase: "final_answer" }] }] };
   const second = new JobManager(secondFake, { store });
   await second.initialize();
+  assert.equal(second.get(started.job_id).revision, persistedRevision);
   assert.equal(second.get(started.job_id).status, "completed");
   assert.equal(second.get(started.job_id).final_message, "persistido");
   assert.equal(secondFake.requests.some((request) => request.method === "thread/read"), false);
@@ -353,6 +572,19 @@ test("codex_get ve el índice persistido antes de initialize", async () => {
   const started = await manager.start(workspace, "visible tras restart");
   const restarted = new JobManager(new FakeAppServer(), { store });
   assert.equal(restarted.get(started.job_id).job_id, started.job_id);
+});
+
+test("state antiguo sin revision se rehidrata con revision 0", () => {
+  const directory = mkdtempSync(path.join(tmpdir(), "codex-agent-mcp-"));
+  const file = path.join(directory, "state.json");
+  writeFileSync(file, JSON.stringify({ version: 1, jobs: [{
+    job_id: "legacy-job", thread_id: "legacy-thread", workspace, turn_id: null, status: "completed",
+    final_message: "legacy", latest_diff: null, files_changed: [], commands_executed: [], error: null,
+    updated_at: new Date().toISOString(),
+  }] }));
+  const manager = new JobManager(new FakeAppServer(), { store: new StateStore(file) });
+  assert.equal(manager.get("legacy-job").revision, 0);
+  assert.equal(manager.get("legacy-job").final_message, "legacy");
 });
 
 test("thread/start timeout queda journalizado y activa el fence sin adopción heurística", async () => {

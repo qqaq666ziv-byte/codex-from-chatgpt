@@ -17,6 +17,20 @@ export type PersistedJob = {
   commands_executed: string[];
   error: string | null;
   updated_at: string;
+  /** Added in v0.2. Older state files omit this and migrate to revision 0. */
+  revision?: number;
+  validation?: PersistedValidation[];
+  warnings?: string[];
+  activity?: string | null;
+  completion_report_injected?: boolean;
+};
+
+export type PersistedValidation = {
+  kind: string;
+  command: string;
+  status: string;
+  exit_code?: number;
+  output_tail?: string;
 };
 
 type PersistedState = {
@@ -32,6 +46,21 @@ function nullableString(value: unknown): string | null {
   return value === null ? null : typeof value === "string" ? value : null;
 }
 
+function optionalNullableString(value: unknown): boolean {
+  return value === undefined || value === null || typeof value === "string";
+}
+
+function validValidation(value: unknown): value is PersistedValidation {
+  if (!isObject(value)) return false;
+  return (
+    typeof value.kind === "string" && value.kind.length > 0 &&
+    typeof value.command === "string" && value.command.length > 0 &&
+    typeof value.status === "string" && value.status.length > 0 &&
+    (value.exit_code === undefined || typeof value.exit_code === "number" && Number.isInteger(value.exit_code)) &&
+    (value.output_tail === undefined || typeof value.output_tail === "string")
+  );
+}
+
 function validJob(value: unknown): value is PersistedJob {
   if (!isObject(value)) return false;
   return (
@@ -45,7 +74,12 @@ function validJob(value: unknown): value is PersistedJob {
     Array.isArray(value.files_changed) && value.files_changed.every((item) => typeof item === "string") &&
     Array.isArray(value.commands_executed) && value.commands_executed.every((item) => typeof item === "string") &&
     nullableString(value.error) === value.error &&
-    typeof value.updated_at === "string"
+    typeof value.updated_at === "string" &&
+    (value.revision === undefined || typeof value.revision === "number" && Number.isInteger(value.revision) && value.revision >= 0) &&
+    (value.validation === undefined || Array.isArray(value.validation) && value.validation.every(validValidation)) &&
+    (value.warnings === undefined || Array.isArray(value.warnings) && value.warnings.every((item) => typeof item === "string")) &&
+    optionalNullableString(value.activity) &&
+    (value.completion_report_injected === undefined || typeof value.completion_report_injected === "boolean")
   );
 }
 

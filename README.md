@@ -30,7 +30,7 @@ ChatGPT
 Codex works on your actual local repo.
 ```
 
-> **Dogfooded:** v0.2 was developed using v0.1 — ChatGPT orchestrated local
+> **Dogfooded:** v0.3 was developed using v0.2 — ChatGPT orchestrated local
 > Codex implementation and independent review through this MCP. See
 > [Built using itself](#built-using-itself).
 
@@ -69,8 +69,8 @@ The same loop maintains it. Using the [five tools](#mcp-tools) described below:
 
 1. Use `codex_start` to investigate a change and its risks.
 2. Use `codex_continue` to implement or fix one concrete part.
-3. Use `codex_get` to review the diff, files, commands, errors, and pending
-   approvals.
+3. Use `codex_get` to review the standard handoff; request `debug` only when
+   the bounded command log or diff is needed.
 4. Use `codex_respond_approval` to answer specific approvals via their exact
    `request_id`.
 5. Run independent reviews, then `npm run typecheck`, `npm test`, and
@@ -290,7 +290,7 @@ then check the result with codex_get.
 The normal flow is:
 
 1. `codex_start` creates the persistent thread and begins the first turn.
-2. `codex_get` returns the compact job snapshot.
+2. `codex_get` returns the revision-aware job snapshot (standard by default).
 3. When a turn finishes, `codex_continue` sends the next instruction to the
    same thread.
 4. If Codex asks for an approval, `codex_respond_approval` answers it using the
@@ -304,15 +304,41 @@ The public surface is exactly this:
 | Tool | Schema | Semantics |
 | --- | --- | --- |
 | `codex_start` | `{ workspace: string, prompt: string }` | Validates the workspace, creates a persistent thread, starts a turn. |
-| `codex_get` | `{ job_id: string }` | Returns a compact job summary. |
+| `codex_get` | `{ job_id: string, detail?: "compact" \| "standard" \| "debug", since_revision?: number }` | Returns a revision-aware job snapshot; `standard` is the default. |
 | `codex_continue` | `{ job_id: string, prompt: string }` | Reuses the same thread and starts another turn once the previous one ended. |
 | `codex_interrupt` | `{ job_id: string }` | Runs `turn/interrupt` on the active turn. |
 | `codex_respond_approval` | `{ job_id: string, request_id: string \| number, decision: ... }` | Answers one specific app-server approval. |
 
-`codex_get` returns `status`, `job_id`, `thread_id`, `turn_id`,
-`final_message`, `latest_diff`, `files_changed`, `commands_executed`, `error`,
-`pending_approvals`, and — for compatibility — `pending_approval` as an alias
-for the first approval. It never returns the raw JSONL stream.
+`codex_get` has three deliberately different payload sizes:
+
+- `compact` is for polling: status, revision, current activity, and critical
+  errors or approvals.
+- `standard` is the default supervisory handoff. While running it includes
+  useful activity and changed files; after completion it includes the final
+  message, files, deterministic diffstat, and recognized validation results,
+  without the full command log or patch.
+- `debug` includes bounded `commands_executed` and `latest_diff` fields for
+  diagnosis. The underlying state remains available for recovery and is not
+  discarded when standard hides it.
+
+Pass `since_revision` from the previous response to suppress unchanged compact/
+standard supervisory payloads; `debug` is always an on-demand current diagnostic
+snapshot. An unchanged response is intentionally tiny (`status`, `revision`,
+and `unchanged: true`), but pending approvals and errors are still surfaced.
+The revision is persisted per job and tracks supervisory/control-plane state.
+Debug-only command history and raw diff changes can update without advancing
+it.
+
+Every persistent thread also receives one short internal completion-handoff
+requirement automatically. It asks Codex's final response to state actions,
+files changed, validation and results, plus unresolved warnings or limitations;
+the caller's original prompt remains intact, and the requirement is not
+repeated on every continuation.
+
+Approvals include their exact `request_id`, kind, and enough detail to choose a
+decision even in compact or unchanged polling responses. `pending_approval`
+remains an alias for the first approval, while `pending_approvals` carries all
+currently pending approvals. The bridge never returns the raw JSONL stream.
 
 Approvals accept only the values and objects defined by the installed protocol
 for command execution, file changes, permissions, and legacy approvals.
@@ -324,7 +350,7 @@ never answered by position or by "the last one received".
 States are `starting`, `running`, `awaiting_approval`, `interrupting`,
 `completed`, `interrupted`, `failed`, and `recovery_required`.
 
-v0.2 allows a single active turn per process/app-server. A concurrent `start`
+v0.3 allows a single active turn per process/app-server. A concurrent `start`
 or `continue` returns a semantic backend-busy error; `interrupt` remains
 available for the active turn. A process failure or a timeout with an uncertain
 outcome leaves the job in `recovery_required` — never in an invented
