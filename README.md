@@ -2,7 +2,9 @@
 
 讓一般 ChatGPT Chat 規劃與審查，由本機 Codex 修改程式、執行測試，並保留可逐頁查核的證據。
 
-目前版本 **0.4.0**。已實測一般 ChatGPT 透過 HTTPS／OAuth 交辦、由本機 Codex 修改程式並通過 30 項測試，再由 ChatGPT 讀完完整證據、保存審查通過。**固定日常入口與重啟免重新掛載尚未完成，整個產品尚未宣告驗收完成**。安裝技能不等於建立連線。
+目前版本 **0.4.1**：新增 Windows 私密備份／驗證／還原、失敗更新的啟動保護，以及受成本關卡保護的官方 Secure Tunnel 候選入口。**固定日常入口仍未完成**：Tunnel 零新增費用尚未獲官方資料確認，瀏覽器 OAuth 仍依賴現有公開授權入口。保留已工作的 Quick Tunnel，未切換預設 transport、建立 runtime key 或設定開機常駐。詳見 [本輪交付與啟用條件](docs/SECURE-TUNNEL.md)。
+
+`cc18c40` 的歷史驗收已走通一般 ChatGPT → HTTPS／OAuth → 本機 Codex 真實修改與 30 項測試 → ChatGPT 讀完整證據並保存 review pass；這不是新版 Secure Tunnel E2E。安裝技能不等於建立連線。
 
 從 [joseanu/codex-from-chatgpt](https://github.com/joseanu/codex-from-chatgpt/tree/093bd39ea0770a80612a5184a85b82262759aa00) 的 0.3.1 延伸，保留 MIT 授權及來源歷史。這是社群產品，並非 OpenAI 官方產品。
 
@@ -55,7 +57,7 @@ ProjectPath 請換成你授權的既有 Git 儲存庫根目錄。預設使用可
 
 目前完整原始碼證據限於 Git 追蹤或未忽略的 UTF-8 一般檔案，每檔 2 MiB、每專案 32 MiB。認證／私密檔名排除並列明；二進位、非 UTF-8、link 或 token 遮蔽造成內容不完整時，不會宣告完整審查通過。regex 遮蔽只是補充，不能保證偵測所有秘密。專案註冊控制交辦與證據路徑；實際命令仍受 Codex 的平台 sandbox／核准政策約束，不能將 registry 說成額外的 OS 讀取隔離。
 
-`.runtime`、`.local-tests`、`.tools` 不提交；Windows runtime 使用私人 ACL。更新時先停止任務、通道及服務，再選取已檢查的版本。恢復方法見 [安裝指南](docs/INSTALL-WINDOWS.md) 與 [架構及恢復規則](docs/ARCHITECTURE.md)。
+`.runtime`、`.local-tests`、`.tools`、`.backups` 不提交；Windows runtime 與備份使用私人 ACL。更新時先完成或處理任務、停止通道及服務，再選取已檢查的版本。`update` 會先製作並驗證備份；`restore` 保留還原前狀態。恢復方法見 [安裝指南](docs/INSTALL-WINDOWS.md) 與 [架構及恢復規則](docs/ARCHITECTURE.md)。
 
 ## 驗證與來源
 

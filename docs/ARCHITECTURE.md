@@ -2,6 +2,8 @@
 
 一般 ChatGPT 的 MCP 工具經 Quick Tunnel HTTPS、本機 OAuth gateway 與經認證的 loopback HTTP 服務進入 AutoDev；本機 MCP 客戶端也可使用 stdio proxy。AutoDev 使用官方 Codex App Server 的 thread/turn 執行介面。沒有另外計費的 API 規劃者，也沒有自製聊天介面。
 
+0.4.1 在相同 OAuth gateway 前增加 Secure MCP Tunnel 候選 transport，仍受零新增費用關卡保護。它不更換 core 狀態機、不用 tunnel ID 當 reviewer identity；官方 transport 不能自行解決瀏覽器 OAuth 公開入口。完整決策及尚未驗收部分見 [SECURE-TUNNEL.md](SECURE-TUNNEL.md)。
+
 ## 儲存與身分
 
 `jobs.json` 是 executor 索引；`product-state.json` 保存需求及每輪證據／審查對應；`requests.json` 保存操作雜湊與結果；`evidence` 儲存不可覆寫的版本化 snapshot。它們都位於設定檔同一 private runtime 下。程序需要持有 OS writer lease，所有上層異動序列化。寫入先完成暫存內容、fsync，再原子替換；checksum/schema 不符時拒絕啟動。fsync 與原子替換仍依底層 OS、磁碟及檔案系統保證，不能據此宣稱已測試真實斷电容錯。

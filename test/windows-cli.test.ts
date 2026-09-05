@@ -47,7 +47,7 @@ function fixture(port: number, options: { wrongIdentity?: boolean; exitEarly?: b
   mkdirSync(scripts);
   mkdirSync(runtime);
   mkdirSync(path.join(root, "dist", "src"), { recursive: true });
-  for (const file of ["autodev.ps1", "local-common.ps1"]) copyFileSync(path.join(product, "scripts", file), path.join(scripts, file));
+  for (const file of ["autodev.ps1", "local-common.ps1", "backup-common.ps1"]) copyFileSync(path.join(product, "scripts", file), path.join(scripts, file));
   writeFileSync(path.join(root, "package.json"), JSON.stringify({ type: "commonjs" }));
   writeFileSync(path.join(runtime, "config.json"), JSON.stringify({ schemaVersion: 1, host: "127.0.0.1", port, model: "fake-model", reasoningEffort: "high", projects: [], ...options }));
   writeFileSync(path.join(runtime, "admin-token"), fakeToken);

@@ -5,13 +5,14 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { loadLocalConfig, readLocalToken } from './local-config.js';
 
-/** Official secure-tunnel child: exposes only the authenticated MCP tool surface, never admin. */
+/** Local MCP client proxy only. The Secure Tunnel candidate uses OAuth HTTP:
+ * local client identity must not stand in for distinct remote reviewers. */
 async function main() {
   const config=loadLocalConfig();
   const token=readLocalToken(config.runtimeDir,'client');
-  const client=new Client({name:'autodev-secure-tunnel-proxy',version:'0.4.0'});
+  const client=new Client({name:'autodev-secure-tunnel-proxy',version:'0.4.1'});
   await client.connect(new StreamableHTTPClientTransport(new URL(`http://${config.host}:${config.port}/mcp`),{requestInit:{headers:{Authorization:`Bearer ${token}`}}}));
-  const server=new Server({name:'AutoDev',version:'0.4.0'},{capabilities:{tools:{}}});
+  const server=new Server({name:'AutoDev',version:'0.4.1'},{capabilities:{tools:{}}});
   server.setRequestHandler(ListToolsRequestSchema,async()=>client.listTools());
   server.setRequestHandler(CallToolRequestSchema,async request=>client.callTool(request.params));
   const transport=new StdioServerTransport();

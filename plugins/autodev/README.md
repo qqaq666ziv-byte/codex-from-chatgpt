@@ -2,7 +2,7 @@
 
 這是可攜式 planner/reviewer 技能套件，包含 `.codex-plugin/plugin.json` 與 `skills/autodev-workflow/SKILL.md`。它配合另行掛載的 AutoDev MCP 使用，沒有嵌入端點或憑證。
 
-ChatGPT 的實際連線與驗證步驟見產品儲存庫的 `docs/INSTALL-WINDOWS.md`。目前開發方案使用免費 Quick Tunnel HTTPS 與本機 OAuth gateway，無需 OpenAI API Key；OAuth 連線由使用者比對瀏覽器驗證碼並在本機核准。這與 Codex 任務的執行權限核准是兩件事。Quick Tunnel 重啟後 URL 改變，需重新掛載，因此尚不是固定日常入口。
+ChatGPT 的實際連線與驗證步驟見產品儲存庫的 `docs/INSTALL-WINDOWS.md`。保留的開發方案使用免費 Quick Tunnel HTTPS 與本機 OAuth gateway；0.4.1 另加入受成本關卡保護的官方 Secure Tunnel 候選，詳見 `docs/SECURE-TUNNEL.md`。OAuth 連線由使用者比對瀏覽器驗證碼並在本機核准，與 Codex 任務的執行權限核准分開。固定日常入口尚未完成；不能把安裝本技能當成 Tunnel 已啟用或 ChatGPT 已完成 E2E。
 
 先完成 MCP 掛載，再依目前帳號支援的本機 plugin／skill 匯入方式加入本資料夾。若介面只提供 MCP 連線，可以先使用伺服器工具說明；技能不是掛載成功的證明。啟動 HTTPS 或完成本機測試也不代表真正 ChatGPT 已完成唯讀、寫入與審查驗收。
 

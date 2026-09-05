@@ -54,7 +54,9 @@ function New-AutoDevToken {
 
 function Read-AutoDevConfig([string]$Path) {
   if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw 'Run setup before this command.' }
-  $Config = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json
+  if ((Get-Item -LiteralPath $Path -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Runtime configuration must not be a link.' }
+  try { $Config = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json }
+  catch { throw 'Local runtime configuration is unreadable or malformed; its contents were not printed.' }
   if ($Config.schemaVersion -ne 1 -or $Config.host -ne '127.0.0.1' -or
       [string]$Config.port -notmatch '^[0-9]+$' -or $Config.port -lt 1024 -or $Config.port -gt 65535 -or
       [string]::IsNullOrWhiteSpace($Config.model) -or [string]::IsNullOrWhiteSpace($Config.reasoningEffort)) { throw 'Invalid local runtime configuration.' }
@@ -92,7 +94,9 @@ function Test-AutoDevOwnedProcess($Record, $Info, [string]$Root) {
 
 function Read-AutoDevProcessRecord([string]$Path) {
   if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
-  $Record = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json
+  if ((Get-Item -LiteralPath $Path -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Process record must not be a link.' }
+  try { $Record = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json }
+  catch { throw 'Process record is unreadable or malformed; manual inspection required.' }
   if ([string]$Record.pid -notmatch '^[1-9][0-9]*$') { throw 'Invalid process record; manual inspection required.' }
   return $Record
 }

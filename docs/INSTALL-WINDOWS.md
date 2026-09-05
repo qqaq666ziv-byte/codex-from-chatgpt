@@ -1,5 +1,7 @@
 # Windows 安裝、連線與接續
 
+2026-09-05 的 0.4.1 已加入 [Secure Tunnel 候選入口、成本關卡與備份／還原](SECURE-TUNNEL.md)，但尚未啟用。下方 Quick Tunnel 是保留的已驗證開發／恢復路徑；新的固定入口不是完成狀態。圖示與 App 欄位見 [CHATGPT-APP.md](CHATGPT-APP.md)。
+
 本指南從 **AutoDev 產品儲存庫根目錄**執行。一般 ChatGPT 負責規劃與審查，這部電腦上的 Codex 負責修改與測試。`plugins/autodev` 是搭配 MCP 使用的技能；單獨匯入技能不代表 ChatGPT 已連上本機。
 
 ## 本機安裝
@@ -44,7 +46,7 @@ pwsh.exe -NoProfile -File .\scripts\connect-chatgpt.ps1 run
 pwsh.exe -NoProfile -File .\scripts\connect-chatgpt.ps1 status
 ```
 
-將**這次 status 顯示的 MCP HTTPS URL**填入 ChatGPT 的 Plugins 開發者連線：Connection 選 Server URL，認證選 OAuth，依平台顯示完成連線。不要選需要 runtime API key 的 Secure MCP Tunnel，也不要關閉 OAuth 或把本機 admin token 貼進 ChatGPT。開發者模式與帳號平台確認仍由使用者處理；詳見 [官方 ChatGPT 連線流程](https://developers.openai.com/plugins/deploy/connect-chatgpt)。
+使用保留的 Quick Tunnel 路徑時，將**這次 status 顯示的 MCP HTTPS URL**填入 ChatGPT 的 Plugins 開發者連線：Connection 選 Server URL，認證選 OAuth。Secure MCP Tunnel 另依本版成本關卡与驗收流程啟用，不能因 runtime key 用於認證就推論免費。不要關閉 OAuth 或把本機 admin token 貼進 ChatGPT。開發者模式與帳號平台確認仍由使用者處理；詳見 [官方 ChatGPT 連線流程](https://developers.openai.com/plugins/deploy/connect-chatgpt)。
 
 OAuth 瀏覽器頁面會出現本次授權請求與驗證碼。**只有你剛剛在 ChatGPT 主動發起連線、且瀏覽器頁面與本機待核准請求相符時**，才在本機執行：
 
@@ -118,6 +120,8 @@ pwsh.exe -NoProfile -File .\scripts\autodev.ps1 answer -JobId '實際job-id' -Tu
 答案是明確產品選擇，不能代替權限核准。答案檔如含私人內容，使用後留在自己的私密位置，不提交到產品儲存庫。
 
 ## 更新與回復
+
+0.4.1 的 `update` 會在停止狀態下先製作、驗證私密 runtime 備份。可另用 `backup`、`verify-backup -BackupId ID`、`restore -BackupId ID`；restore 保留當前原目錄並要求重建 source 後才能 start。失敗 setup/update 會留下 `build-incomplete.json` 以拒絕啟動半成品。完整規則見 [本版備份與 rollback](SECURE-TUNNEL.md#更新備份與-rollback)。
 
 `update` 更新的是**目前已選取的本機程式版本**：安裝 lockfile、型別檢查、測試、建置，不 fetch、pull、merge、push 或更換分支。先記下 `git rev-parse HEAD` 與 `git status --short`，保存未提交變更；確認任務完成或明確取消後停止通道及 AutoDev，也先結束這個 checkout 的測試與開發程序，避免 Windows 鎖住 `node_modules` 內的工具。由使用者或獲授權的開發流程選取已檢查的新 commit，再執行：
 

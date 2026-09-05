@@ -15,3 +15,5 @@ protocol/*-json-schema/
 .runtime/
 .local-tests/
 .tools/
+.backups/
+.runtime-restore-*/

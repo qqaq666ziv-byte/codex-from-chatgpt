@@ -12,7 +12,7 @@ export const answersSchema=z.record(z.string(),z.object({answers:z.array(z.strin
 export const approvalSchema=z.object({...pendingFields,decision:z.enum(['accept','decline','cancel'])}).strict();
 export const answerSchema=z.object({...pendingFields,answers:answersSchema}).strict();
 export function createMcpServer(product:AutoDev,session:string):McpServer {
-  const server=new McpServer({name:'AutoDev',version:'0.4.0'});
+  const server=new McpServer({name:'AutoDev',version:'0.4.1'});
   function register<T extends z.ZodRawShape>(name:string,description:string,inputSchema:T,readOnly:boolean,handler:(args:z.infer<z.ZodObject<T>>)=>unknown|Promise<unknown>) {
     const callback=async(args:unknown):Promise<CallToolResult>=>{
       try {const value=await handler(args as z.infer<z.ZodObject<T>>); const normalized=JSON.parse(JSON.stringify(name==='autodev_artifact'?value:redactValue(value))) as Record<string,unknown>;return {content:[{type:'text' as const,text:JSON.stringify(normalized)}],structuredContent:normalized};}

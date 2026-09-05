@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
   [Parameter(Position = 0, Mandatory = $true)]
-  [ValidateSet('setup', 'update', 'start', 'stop', 'restart', 'status', 'doctor', 'add-project', 'approve', 'answer')]
+  [ValidateSet('setup', 'update', 'backup', 'verify-backup', 'restore', 'start', 'stop', 'restart', 'status', 'doctor', 'add-project', 'approve', 'answer')]
   [string]$Command,
   [ValidateRange(1024, 65535)][int]$Port = 8790,
   [string]$ProjectId,
@@ -12,19 +12,31 @@ param(
   [string]$RequestId,
   [ValidateSet('string', 'number')][string]$RequestIdType = 'string',
   [ValidateSet('accept', 'decline', 'cancel')][string]$Decision,
-  [string]$AnswersFile
+  [string]$AnswersFile,
+  [string]$BackupId
 )
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'local-common.ps1')
+. (Join-Path $PSScriptRoot 'backup-common.ps1')
 $Root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..')).TrimEnd('\')
 $Runtime = Join-Path $Root '.runtime'
 $ConfigPath = Join-Path $Runtime 'config.json'
 $RecordPath = Join-Path $Runtime 'server-process.json'
+$ExplicitPortRequested = $PSBoundParameters.ContainsKey('Port')
 
 function Assert-AutoDevStoppedForBuild {
-  $Record = Read-AutoDevProcessRecord $RecordPath
-  if ($Record -and (Get-AutoDevProcessInfo ([int]$Record.pid))) {
-    throw 'Setup/update requires AutoDev to be stopped. Check status, finish or cancel active work, then run stop. No dependencies or built files were changed.'
+  if (Test-Path -LiteralPath $Runtime) { Assert-AutoDevPhysicalTree $Runtime }
+  foreach ($Name in @('server-process.json', 'gateway.json', 'secure-tunnel-process.json')) {
+    $Record = Read-AutoDevProcessRecord (Join-Path $Runtime $Name)
+    if ($Record -and (Get-AutoDevProcessInfo ([int]$Record.pid))) {
+      throw 'Maintenance requires the core and every managed connection to be stopped. Check status and reconcile active work first. No process was stopped or built files changed.'
+    }
+    foreach ($Field in @('publicPort', 'controlPort', 'healthPort')) {
+      if ($Record -and $null -ne $Record.$Field) {
+        if ([string]$Record.$Field -notmatch '^[0-9]+$' -or [int]$Record.$Field -lt 1024 -or [int]$Record.$Field -gt 65535) { throw 'Invalid managed connection port; maintenance refused.' }
+        if (-not (Test-AutoDevPortFree ([int]$Record.$Field))) { throw 'A managed connection port is occupied; maintenance will not replace a listener.' }
+      }
+    }
   }
   if (Test-Path -LiteralPath $ConfigPath -PathType Leaf) {
     $Config = Read-AutoDevConfig $ConfigPath
@@ -32,8 +44,32 @@ function Assert-AutoDevStoppedForBuild {
   }
 }
 
+function Invoke-AutoDevMaintenance([scriptblock]$Operation) {
+  Assert-AutoDevStoppedForBuild
+  $Leases = @()
+  try {
+    if (Test-Path -LiteralPath $Runtime -PathType Container) {
+      Assert-AutoDevPhysicalTree $Runtime
+      $Leases += Enter-AutoDevOfflineLease $Runtime
+      foreach ($Name in @('gateway-lease', 'secure-tunnel-lease')) {
+        $LeaseDirectory = Join-Path $Runtime $Name
+        # Reserve even absent lease directories: a concurrently launched gateway
+        # must acquire this same mutex before creating its public connection.
+        if (-not (Test-Path -LiteralPath $LeaseDirectory)) { New-Item -ItemType Directory -Path $LeaseDirectory | Out-Null }
+        $Leases += Enter-AutoDevOfflineLease $LeaseDirectory
+      }
+      Assert-AutoDevStoppedForBuild
+    }
+    & $Operation
+  } finally {
+    foreach ($Lease in $Leases) { $Lease.ReleaseMutex(); $Lease.Dispose() }
+  }
+}
+
 function Build-AutoDev([bool]$Verify) {
   Assert-AutoDevStoppedForBuild
+  $BuildMarker = Join-Path $Runtime 'build-incomplete.json'
+  Write-AutoDevAtomicText $BuildMarker ('{"schemaVersion":1,"status":"incomplete"}')
   Push-Location $Root
   try {
     & npm.cmd ci --ignore-scripts --no-audit --no-fund
@@ -46,10 +82,12 @@ function Build-AutoDev([bool]$Verify) {
     }
     & npm.cmd run build
     Assert-AutoDevExit 'Building AutoDev' $LASTEXITCODE
+    Remove-Item -LiteralPath $BuildMarker -Force -ErrorAction Stop
   } finally { Pop-Location }
 }
 
 function Start-AutoDev {
+  if (Test-Path -LiteralPath (Join-Path $Runtime 'build-incomplete.json')) { throw 'The previous setup/update build is incomplete. Select the intended source version and complete update before starting.' }
   $Config = Read-AutoDevConfig $ConfigPath
   Protect-AutoDevRuntime $Runtime
   $Existing = Read-AutoDevProcessRecord $RecordPath
@@ -128,34 +166,52 @@ try {
   switch ($Command) {
     'setup' {
       Assert-AutoDevStoppedForBuild
-      $Node = (Get-Command node.exe -ErrorAction Stop).Source
-      $Version = & $Node --version
-      Assert-AutoDevExit 'Node version check' $LASTEXITCODE
-      if ([int]($Version.TrimStart('v').Split('.')[0]) -lt 20) { throw 'Node.js 20 or later is required.' }
-      $null = Get-Command codex -ErrorAction Stop
-      $null = Get-Command npm.cmd -ErrorAction Stop
-      Protect-AutoDevRuntime $Runtime
-      if (-not (Test-Path -LiteralPath $ConfigPath)) {
-        $ChosenPort = $Port
-        while (-not (Test-AutoDevPortFree $ChosenPort)) {
-          if ($PSBoundParameters.ContainsKey('Port') -or $ChosenPort -ge [Math]::Min($Port + 100, 65535)) { throw 'No requested loopback port is available; no service was changed.' }
-          $ChosenPort++
+      if (-not (Test-Path -LiteralPath $Runtime)) { Protect-AutoDevRuntime $Runtime }
+      Invoke-AutoDevMaintenance {
+        $Node = (Get-Command node.exe -ErrorAction Stop).Source
+        $Version = & $Node --version
+        Assert-AutoDevExit 'Node version check' $LASTEXITCODE
+        if ([int]($Version.TrimStart('v').Split('.')[0]) -lt 20) { throw 'Node.js 20 or later is required.' }
+        $null = Get-Command codex -ErrorAction Stop
+        $null = Get-Command npm.cmd -ErrorAction Stop
+        if (Test-Path -LiteralPath $ConfigPath) { Assert-AutoDevOfflineState $Runtime }
+        elseif (@('jobs.json', 'product-state.json', 'requests.json') | Where-Object { Test-Path -LiteralPath (Join-Path $Runtime $_) }) { throw 'Persisted state exists without its runtime configuration; recover the matching configuration before setup.' }
+        Protect-AutoDevRuntime $Runtime
+        if (-not (Test-Path -LiteralPath $ConfigPath)) {
+          $ChosenPort = $Port
+          while (-not (Test-AutoDevPortFree $ChosenPort)) {
+            if ($ExplicitPortRequested -or $ChosenPort -ge [Math]::Min($Port + 100, 65535)) { throw 'No requested loopback port is available; no service was changed.' }
+            $ChosenPort++
+          }
+          $Config = [ordered]@{ schemaVersion = 1; host = '127.0.0.1'; port = $ChosenPort; model = 'gpt-6-astra'; reasoningEffort = 'xhigh'; projects = @() }
+          Write-AutoDevAtomicText $ConfigPath ($Config | ConvertTo-Json -Depth 10)
+        } else { $null = Read-AutoDevConfig $ConfigPath }
+        foreach ($Name in @('client-token', 'admin-token')) {
+          $TokenPath = Join-Path $Runtime $Name
+          if (-not (Test-Path -LiteralPath $TokenPath)) { Write-AutoDevAtomicText $TokenPath (New-AutoDevToken) }
         }
-        $Config = [ordered]@{ schemaVersion = 1; host = '127.0.0.1'; port = $ChosenPort; model = 'gpt-6-astra'; reasoningEffort = 'xhigh'; projects = @() }
-        Write-AutoDevAtomicText $ConfigPath ($Config | ConvertTo-Json -Depth 10)
-      } else { $null = Read-AutoDevConfig $ConfigPath }
-      foreach ($Name in @('client-token', 'admin-token')) {
-        $TokenPath = Join-Path $Runtime $Name
-        if (-not (Test-Path -LiteralPath $TokenPath)) { Write-AutoDevAtomicText $TokenPath (New-AutoDevToken) }
+        Assert-AutoDevOfflineState $Runtime
+        Build-AutoDev $false
+        Write-Output 'AutoDev setup completed. Tokens remain private. Register a project with add-project, then start.'
       }
-      Build-AutoDev $false
-      Write-Output 'AutoDev setup completed. Tokens remain private. Register a project with add-project, then start.'
     }
     'update' {
       $null = Read-AutoDevConfig $ConfigPath
-      Build-AutoDev $true
-      Write-Output 'The selected local source version is built and verified. Runtime state, project configuration and tokens were preserved. Run start when ready.'
+      Invoke-AutoDevMaintenance {
+        $CreatedBackup = New-AutoDevBackup $Root $Runtime
+        Write-Output "Verified private runtime backup: $CreatedBackup"
+        Build-AutoDev $true
+        Write-Output 'The selected local source version is built and verified. Runtime state, project configuration and tokens were preserved. Run start when ready.'
+      }
     }
+    'backup' {
+      Invoke-AutoDevMaintenance {
+        $CreatedBackup = New-AutoDevBackup $Root $Runtime
+        Write-Output "Verified private runtime backup: $CreatedBackup"
+      }
+    }
+    'verify-backup' { $null = Test-AutoDevBackup $Root $BackupId; Write-Output "Runtime backup $BackupId passed schema and SHA256 verification." }
+    'restore' { Invoke-AutoDevMaintenance { Restore-AutoDevBackup $Root $Runtime $BackupId } }
     'start' { Start-AutoDev }
     'stop' { Stop-AutoDev }
     'restart' { Stop-AutoDev; Start-AutoDev }
