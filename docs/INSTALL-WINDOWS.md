@@ -1,12 +1,12 @@
 # Windows 安裝、連線與接續
 
-2026-09-05 的 0.4.1 已加入 [Secure Tunnel 候選入口、成本關卡與備份／還原](SECURE-TUNNEL.md)，但尚未啟用。下方 Quick Tunnel 是保留的已驗證開發／恢復路徑；新的固定入口不是完成狀態。圖示與 App 欄位見 [CHATGPT-APP.md](CHATGPT-APP.md)。
+0.4.2 的日常入口是 [Workers Free 固定入口](FIXED-ENTRY.md)，實際結果見 [固定入口驗收](FIXED-ENTRY-VALIDATION.md)。下方 Quick Tunnel 專節僅供 development recovery。圖示與固定 App 欄位見 [CHATGPT-APP.md](CHATGPT-APP.md)；OpenAI Secure MCP Tunnel 留作 [成本未確認的候選](SECURE-TUNNEL.md)。
 
 本指南從 **AutoDev 產品儲存庫根目錄**執行。一般 ChatGPT 負責規劃與審查，這部電腦上的 Codex 負責修改與測試。`plugins/autodev` 是搭配 MCP 使用的技能；單獨匯入技能不代表 ChatGPT 已連上本機。
 
 ## 本機安裝
 
-需要已安裝的 Node.js 20 以上、npm、Git 與官方 Codex CLI，以及可執行本機腳本的 PowerShell。本機驗證時 PowerShell 7 可以執行，Windows PowerShell 5.1 的預設政策拒絕載入腳本，因此以下以 `pwsh.exe` 為預設。腳本也保持 5.1 相容，但只有在其政策允許的環境才能使用 `powershell.exe` 執行。本專案不修改系統執行政策、防火牆或開機常駐設定，也不全域安裝工具。若腳本被組織政策阻擋，依管理員提供的支援方式處理。
+需要已安裝的 Node.js **22 以上**（固定入口部署工具要求）、npm、Git 與官方 Codex CLI，以及 PowerShell。本次使用 Node 24.16.0，腳本在 Windows PowerShell 5.1 與 PowerShell 7 都做了行為測試。以下以 `pwsh.exe` 為例；可對已核對的單一腳本使用 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File ...`，不修改系統政策。本專案不修改防火牆、不建立開機常駐、不全域安裝工具，不繞過組織或 Windows Application Control。
 
 先使用官方登入介面，再安裝 lockfile 指定的專案依賴：
 
@@ -23,9 +23,23 @@ pwsh.exe -NoProfile -File .\scripts\autodev.ps1 doctor
 
 只有本機 `add-project` 會增加 allowlist；ChatGPT 工具不能指定任意路徑。新增後在工作結束時 `restart` 載入新設定。設定、兩枚不同用途的本機 token、程序紀錄與任務證據放在 `.runtime`，先限制 Windows ACL 再寫入，並由 Git 忽略。不要把 runtime 複製到公開 issue、聊天或 Git。`doctor` 只顯示登入狀態、版本與經驗證的服務狀態，不印出 token。
 
-## 一般 ChatGPT 的無 API Key 開發連線
+## 固定日常入口
 
-本輪採用 **免費 Quick Tunnel HTTPS 加本機 OAuth gateway**，不需要 OpenAI API Key，也不代用 API 模型規劃或審查。Codex 繼續使用官方 ChatGPT 登入。登入 Platform 不是這條路線的先決條件，無須在 Platform 建立 tunnel 或 key。
+首次依 [FIXED-ENTRY.md](FIXED-ENTRY.md) 安裝固定版本的本地 Wrangler／cloudflared，登入既有 Cloudflare 帳號、核對 Workers Free 與六項零費用條件，完成免費 Worker／KV 部署。首次 ChatGPT App 使用 `fixed-tunnel.ps1 connection-info` 提供的固定 URL 與 OAuth。
+
+之後執行根目錄 `Start-AutoDev.cmd`，或：
+
+```powershell
+pwsh.exe -NoProfile -File .\scripts\autodev.ps1 start
+pwsh.exe -NoProfile -File .\scripts\fixed-tunnel.ps1 start
+pwsh.exe -NoProfile -File .\scripts\fixed-tunnel.ps1 status
+```
+
+status 分別核對 core、owned cloudflared、路由租約與外部 metadata。`ready_for_chatgpt_probe` 只表示可以開始 ChatGPT 探測，不能當成真正工具 E2E。用完可 `fixed-tunnel.ps1 stop` 再 `autodev.ps1 stop`。只重啟通道時使用 `fixed-tunnel.ps1 restart`，既有工作不必重送，App 不必重建。整機 reboot 後由使用者執行同一啟動入口；本輪不宣稱已做整機 reboot 驗收。
+
+## Development fallback：原 Quick App
+
+原開發方案採用 **免費 Quick Tunnel HTTPS 加本機 OAuth gateway**。此節只供固定入口故障時的 development recovery，不是 0.4.2 正常啟動流程。Codex 繼續使用既有官方 ChatGPT 登入。
 
 Quick Tunnel 產生暫時公開的 HTTPS 網址；OAuth gateway 驗證通過的 MCP 請求才會轉送至本機 AutoDev。管理端點與 admin token 保持本機使用。這是一條**開發測試連線**：Cloudflare 不保證 uptime，重啟後網址會改變，必須重新掛載 ChatGPT；它不是固定網址的日常交付。Quick Tunnel 也不支援 SSE，本產品使用 JSON MCP 回應與狀態查詢。來源：[Cloudflare Quick Tunnels](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/do-more-with-tunnels/trycloudflare/)。
 
@@ -83,13 +97,13 @@ stop 結束本次開發 HTTPS 連線，本機任務與證據仍保留。OAuth ga
 
 再次 run 後 Quick Tunnel 會換網址。先查看新的 status URL，再於 ChatGPT 以新 URL 重建開發者連線，重新完成 OAuth 與 Refresh。若保留舊 app，將名稱加上「已停止／舊連線」等明確標記，避免新聊天選錯；修改顯示名稱或保留舊工具清單並不會恢復連線。這個重新掛載步驟是目前開發方案的限制，不能宣稱已完成「安裝一次後固定入口免管理」的日常體驗。
 
-本產品不建立開機常駐服務，不要求使用者建立 API Key，也不更換既有登入或新增 API 模型支出。固定網址與完全自動重連仍待符合使用者成本與權限限制的方案驗證。
+上述 URL 與記憶體 OAuth 限制只適用原 `connect-chatgpt.ps1` fallback。0.4.2 固定入口使用相同公開 issuer 與 DPAPI 持久授權，不需要此節的逐次重掛流程。
 
 ## 日常交辦與平台限制
 
-本機 AutoDev 與遠端連線完成後，可在一般 ChatGPT 直接交辦，例如「請在 demo 修正空值驗證，保留既有介面，執行相關測試並審查結果」。ChatGPT 選取登記的 `project_id`、提交明確需求與驗收條件，保存 job ID，查詢執行狀態並讀取證據。本輪已由真正一般 ChatGPT 交辦隔離專案並讀取完整證據；各層驗收結果見 [驗收紀錄](VALIDATION-2026-09-05.md)，固定日常入口仍待完成。
+本機 AutoDev 與固定入口完成後，可在一般 ChatGPT 直接交辦，例如「請在 demo 修正空值驗證，保留既有介面，執行相關測試並審查結果」。ChatGPT 選取登記的 `project_id`、提交明確需求與驗收條件，保存 job ID，查詢執行狀態並讀取證據。各層結果見 [固定入口驗收](FIXED-ENTRY-VALIDATION.md)。
 
-電腦重開機後先用本機 start／doctor 接續 AutoDev，再啟動開發連線、取得新 URL 並重新掛載 ChatGPT。既有任務不必重送；以 job ID 查詢和接續。若舊聊天呼叫新外掛仍回帳號連線錯誤，從新外掛詳細頁按「在聊天中試用」，選「對話」，以正確的新外掛標籤建立聊天，先唯讀核對原 job，再重新讀完整證據。此次實测可用這個流程恢復，不能只靠在舊聊天文字中改寫外掛名稱。每次換 URL 的手動重新掛載，是目前尚未滿足固定日常入口的限制。
+電腦重開機後使用 `Start-AutoDev.cmd` 接續已設定的 core 與固定入口。既有任務不必重送；以 job ID 查詢和接續。若平台要求重新授權，在同一固定 App 重新 OAuth。核心重啟會清除記憶體中的未提交 evidence 讀取收據，所以審查前要重新讀完整證據；已持久化 review 保留。
 
 服務會保留已完成執行但尚未審查的任務。原聊天回覆結束後自動醒來續審、iOS 的工具支援，都不能由本服務保證。聊天停止時，可在同一或新的已連線聊天說「繼續審查 AutoDev 的 job ……」，重新取得目前證據。不得把 Codex 的完成訊息當成 ChatGPT 已審查通過。
 
@@ -121,7 +135,7 @@ pwsh.exe -NoProfile -File .\scripts\autodev.ps1 answer -JobId '實際job-id' -Tu
 
 ## 更新與回復
 
-0.4.1 的 `update` 會在停止狀態下先製作、驗證私密 runtime 備份。可另用 `backup`、`verify-backup -BackupId ID`、`restore -BackupId ID`；restore 保留當前原目錄並要求重建 source 後才能 start。失敗 setup/update 會留下 `build-incomplete.json` 以拒絕啟動半成品。完整規則見 [本版備份與 rollback](SECURE-TUNNEL.md#更新備份與-rollback)。
+`update` 會在停止狀態下先製作、驗證私密 runtime 備份。可另用 `backup`、`verify-backup -BackupId ID`、`restore -BackupId ID`；restore 保留當前原目錄並要求重建 source 後才能 start。固定入口、core 與其他 gateway 都必須停止，活躍 lease、未完成 OAuth 寫入或未完成部署 fence 會拒絕備份。Cloudflare CLI 登入資料與 volatile 程序設定不備份；還原 OAuth 加密檔會隔離並要求同 App 重新授權。失敗 setup/update 會留下 `build-incomplete.json` 以拒絕啟動半成品。完整規則見 [固定入口恢復](FIXED-ENTRY.md) 與 [既有備份規則](SECURE-TUNNEL.md#更新備份與-rollback)。
 
 `update` 更新的是**目前已選取的本機程式版本**：安裝 lockfile、型別檢查、測試、建置，不 fetch、pull、merge、push 或更換分支。先記下 `git rev-parse HEAD` 與 `git status --short`，保存未提交變更；確認任務完成或明確取消後停止通道及 AutoDev，也先結束這個 checkout 的測試與開發程序，避免 Windows 鎖住 `node_modules` 內的工具。由使用者或獲授權的開發流程選取已檢查的新 commit，再執行：
 

@@ -17,3 +17,6 @@ protocol/*-json-schema/
 .tools/
 .backups/
 .runtime-restore-*/
+.wrangler/
+.dev.vars
+.dev.vars.*

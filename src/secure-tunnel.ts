@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { z } from 'zod';
+import { assertCurrentCostEvidence, costBasisSchema, safeguardsSchema, noChargeSafeguards, type CostBasis } from './cost-policy.js';
 
 export const tunnelRelease = {
   version: '0.0.14',
@@ -24,22 +25,26 @@ export const tunnelConfigSchema = z.object({
   authentication: z.literal('existing-oauth-gateway'),
   cost: z.discriminatedUnion('status', [
     z.object({ status: z.literal('unverified') }).strict(),
-    z.object({ status: z.literal('operator-confirmed-zero'), evidenceUrl: officialEvidence, confirmedAt: z.string().datetime() }).strict(),
+    z.object({ status: z.literal('operator-confirmed-zero'), evidenceUrl: officialEvidence, confirmedAt: z.string().datetime(),
+      basis: costBasisSchema, safeguards: safeguardsSchema, expiresAt: z.string().datetime().optional() }).strict(),
   ]),
 }).strict();
 export type TunnelConfig = z.infer<typeof tunnelConfigSchema>;
 
 export function assertActivationAllowed(config: TunnelConfig) {
   if (config.cost.status !== 'operator-confirmed-zero') {
-    throw new Error('COST_UNVERIFIED: official information has not established zero added cost. No credential was read and no tunnel was contacted.');
+    throw new Error('COST_UNVERIFIED: this plan and account have not established zero additional actual charges. Free tiers and credits are eligible with hard-stop safeguards. No credential was read and no tunnel was contacted.');
   }
+  assertCurrentCostEvidence(config.cost.basis, config.cost.safeguards, config.cost.expiresAt);
 }
 
 /** An operator records externally obtained cost evidence; a URL alone is not proof. */
-export function configuredTunnel(tunnelId: string, healthPort: number, evidenceUrl?: string, confirmed = false): TunnelConfig {
+export function configuredTunnel(tunnelId: string, healthPort: number, evidenceUrl?: string, confirmed = false, basis: CostBasis = 'free-service', expiresAt?: string): TunnelConfig {
   if (Boolean(evidenceUrl) !== confirmed) throw new Error('Supply both explicit zero-cost confirmation and its official evidence reference, or neither.');
-  return tunnelConfigSchema.parse({ schemaVersion: 1, tunnelId, healthPort, authentication: 'existing-oauth-gateway',
-    cost: confirmed ? { status: 'operator-confirmed-zero', evidenceUrl, confirmedAt: new Date().toISOString() } : { status: 'unverified' } });
+  const config = tunnelConfigSchema.parse({ schemaVersion: 1, tunnelId, healthPort, authentication: 'existing-oauth-gateway',
+    cost: confirmed ? { status: 'operator-confirmed-zero', evidenceUrl, confirmedAt: new Date().toISOString(), basis, safeguards: noChargeSafeguards(), ...(expiresAt ? { expiresAt } : {}) } : { status: 'unverified' } });
+  if (confirmed) assertActivationAllowed(config);
+  return config;
 }
 
 export function loadTunnelConfig(runtime: string): TunnelConfig {

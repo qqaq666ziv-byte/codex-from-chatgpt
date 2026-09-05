@@ -9,6 +9,7 @@ import { acquireRuntimeLock } from './runtime-lock.js';
 import { configuredTunnel, loadTunnelConfig, assertActivationAllowed, tunnelArguments, tunnelEnvironment, tunnelReadiness, lastSuccessfulPoll, tunnelRelease, verifyArchive } from './secure-tunnel.js';
 import { processIdentity, requireOwned, type OwnedProcess } from './secure-process.js';
 import { startWindowsJob, type WindowsJob } from './windows-job.js';
+import { costBasisSchema } from './cost-policy.js';
 
 const entry = fileURLToPath(import.meta.url);
 const root = path.resolve(path.dirname(entry), '../..');
@@ -115,6 +116,7 @@ async function run() {
   if (!instance || !/^[a-f0-9-]{36}$/.test(instance)) throw new Error('Start through the owned Windows launcher.');
   let job: WindowsJob | undefined, launching: Promise<WindowsJob> | undefined, closing = false, closePromise: Promise<void> | undefined;
   let managedRecord: RecordFile | undefined;
+  let costTimer: NodeJS.Timeout | undefined;
   let finishStartup!: () => void;
   const startupFinished = new Promise<void>(resolve => { finishStartup = resolve; });
   const startedAt = Date.now();
@@ -138,6 +140,7 @@ async function run() {
   function close(): Promise<void> {
     return closePromise ??= (async () => {
       closing = true;
+      if (costTimer) clearInterval(costTimer);
       // Do not release the lease or close the server before a pending listen /
       // native launch has settled; cancellation cannot leave a later listener.
       await startupFinished;
@@ -179,6 +182,11 @@ async function run() {
     const own = processIdentity(process.pid); if (!own) throw new Error('Cannot record supervisor identity.');
     managedRecord = { schemaVersion: 1, pid: process.pid, created: own.created, executable: process.execPath, entry, instance, controlPort: config.healthPort + 1, healthPort: config.healthPort, shutdownConfirmed: false };
     atomic(recordFile, managedRecord);
+    costTimer = setInterval(() => {
+      try { assertActivationAllowed(config); }
+      catch { console.error('Cost evidence expired; stopping without a paid fallback.'); void close(); }
+    }, 5000);
+    costTimer.unref();
     console.log('Secure Tunnel candidate supervisor started. Check status, then verify from ordinary ChatGPT.');
   } catch (error) { finishStartup(); await close(); throw error; }
   finally { finishStartup(); }
@@ -213,7 +221,7 @@ async function main() {
     const release = await lifecycleLease();
     try {
     assertStopped();
-    const input = configuredTunnel(process.argv[3] ?? '', Number(process.argv[4] ?? '8796'), process.argv[5] || undefined, process.argv[6] === 'confirmed');
+    const input = configuredTunnel(process.argv[3] ?? '', Number(process.argv[4] ?? '8796'), process.argv[5] || undefined, process.argv[6] === 'confirmed', costBasisSchema.parse(process.argv[7] || 'free-service'), process.argv[8] || undefined);
     if (existsSync(configFile) && loadTunnelConfig(runtime).tunnelId !== input.tunnelId) throw new Error('Existing Tunnel identity preserved. Changing it requires an explicit migration.');
     atomic(configFile, input); console.log(`Secure Tunnel configuration saved. Cost status: ${input.cost.status}. No remote request was made.`); return;
     } finally { release(); }

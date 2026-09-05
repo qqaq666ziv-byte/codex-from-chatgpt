@@ -1,0 +1,13 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "autodev-fixed-ingress",
+  "main": "worker.mjs",
+  "compatibility_date": "2026-09-05",
+  "workers_dev": true,
+  "preview_urls": false,
+  "send_metrics": false,
+  "observability": { "enabled": false },
+  "kv_namespaces": [
+    { "binding": "ROUTES", "id": "00000000000000000000000000000000" }
+  ]
+}

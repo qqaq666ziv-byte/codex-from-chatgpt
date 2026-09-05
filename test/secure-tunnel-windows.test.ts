@@ -22,7 +22,7 @@ for (const shell of ['powershell.exe', 'pwsh.exe']) {
     mkdirSync(scripts); mkdirSync(dist, { recursive: true });
     writeFileSync(path.join(directory, 'package.json'), '{"type":"module"}');
     for (const name of ['secure-tunnel.ps1', 'local-common.ps1']) copyFileSync(path.join(product, 'scripts', name), path.join(scripts, name));
-    for (const name of ['secure-tunnel-runner', 'secure-tunnel', 'secure-process', 'local-config', 'runtime-lock', 'windows-job']) {
+    for (const name of ['secure-tunnel-runner', 'secure-tunnel', 'secure-process', 'local-config', 'runtime-lock', 'windows-job', 'cost-policy']) {
       const text = readFileSync(path.join(product, 'src', name + '.ts'), 'utf8');
       writeFileSync(path.join(dist, name + '.js'), transformSync(text, { loader: 'ts', target: 'es2022', format: 'esm' }).code);
     }

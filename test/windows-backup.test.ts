@@ -48,6 +48,10 @@ async function fixture() {
   writeFileSync(path.join(runtime, "secure-tunnel.json"), JSON.stringify({ schemaVersion: 1, tunnelId: "synthetic-fixture-tunnel" }));
   writeFileSync(path.join(runtime, "secure-tunnel-key.dpapi"), "synthetic-ciphertext-fixture-not-a-real-key");
   writeFileSync(path.join(runtime, "secure-tunnel-client.yml"), "synthetic-generated-volatile-config");
+  writeFileSync(path.join(runtime, "fixed-tunnel.json"), JSON.stringify({ schemaVersion: 1 }));
+  writeFileSync(path.join(runtime, "fixed-oauth.dpapi"), "synthetic-encrypted-oauth-snapshot");
+  writeFileSync(path.join(runtime, "fixed-tunnel-client.yml"), "synthetic-volatile-fixed-config");
+  writeFileSync(path.join(runtime, "fixed-cloudflared.yml"), "synthetic-current-volatile-fixed-config");
   const state = { version: 1, records: [] };
   writeFileSync(path.join(runtime, "product-state.json"), JSON.stringify({ checksum: hash(JSON.stringify(state)), state }));
   writeFileSync(path.join(runtime, "requests.json"), JSON.stringify({ schemaVersion: 1, records: [], checksum: hash('{"records":[],"schemaVersion":1}') }));
@@ -58,6 +62,7 @@ async function fixture() {
   writeFileSync(path.join(runtime, "server-process.json"), JSON.stringify({ pid: 2147483647 }));
   writeFileSync(path.join(runtime, "gateway.json"), JSON.stringify({ pid: 2147483647 }));
   writeFileSync(path.join(runtime, "secure-tunnel-process.json"), JSON.stringify({ pid: 2147483647 }));
+  writeFileSync(path.join(runtime, "fixed-gateway-process.json"), JSON.stringify({ pid: 2147483647 }));
   writeFileSync(path.join(binaries, "npm.cmd"), '@echo off\r\necho %*>>"%AUTODEV_TEST_NPM_LOG%"\r\nif "%AUTODEV_TEST_NPM_FAIL%"=="1" exit /b 7\r\nexit /b 0\r\n');
   writeFileSync(path.join(binaries, "codex.cmd"), "@exit /b 0\r\n");
   const npmLog = path.join(root, "npm-invocations.txt");
@@ -101,8 +106,10 @@ for (const shell of ["powershell.exe", "pwsh.exe"]) {
     const location = path.join(value.root, ".backups", id);
     const manifest = JSON.parse(readFileSync(path.join(location, "manifest.json"), "utf8"));
     assert.ok(manifest.files.some((file: { path: string }) => file.path === "secure-tunnel-key.dpapi"));
+    assert.ok(manifest.files.some((file: { path: string }) => file.path === "fixed-oauth.dpapi"));
     assert.ok(manifest.files.some((file: { path: string }) => file.path === "evidence/fixture/artifact.txt"));
     assert.equal(manifest.files.some((file: { path: string }) => /gateway|process|\.log|\.bak|\.yml|lease/.test(file.path)), false);
+    assert.equal(existsSync(path.join(location, "runtime", "fixed-cloudflared.yml")), false);
     const acl = await command(shell, `
 . ${quote(path.join(value.root, "scripts", "local-common.ps1"))}
 if ($PSVersionTable.PSEdition -eq 'Desktop') { Import-Module (Join-Path $PSHOME 'Modules\\Microsoft.PowerShell.Security\\Microsoft.PowerShell.Security.psd1') -ErrorAction Stop }
@@ -120,7 +127,10 @@ $Wrong = @($Items | Where-Object { $Acl = Get-Acl -LiteralPath $_.FullName; -not
     assert.equal(restored.code, 0, restored.output);
     assert.equal(restored.output.includes(token), false);
     assert.equal(readFileSync(path.join(value.runtime, "admin-token"), "utf8"), token);
+    assert.equal(existsSync(path.join(value.runtime, 'fixed-oauth.dpapi')), false, 'Restore must not revive revoked OAuth grants');
+    assert.ok(readdirSync(value.runtime).some(file => /^fixed-oauth-restored-.*\.dpapi$/.test(file)));
     assert.equal(existsSync(path.join(value.runtime, "server-process.json")), false);
+    assert.equal(existsSync(path.join(value.runtime, "fixed-cloudflared.yml")), false);
     assert.ok(existsSync(path.join(value.runtime, "build-incomplete.json")));
     assert.notEqual((await value.run(shell, "start")).code, 0);
     const preserved = restored.output.match(/Preserved prior runtime: ([0-9]{8}T[0-9]{9}Z-[a-f0-9]{12})/)?.[1];
@@ -162,6 +172,14 @@ $Wrong = @(Get-ChildItem -LiteralPath ${quote(path.join(value.root, ".backups", 
     assert.match(successful.output, /built and verified/);
     assert.equal(existsSync(path.join(value.runtime, "build-incomplete.json")), false);
     assert.equal(readFileSync(value.npmLog, "utf8").trim().split(/\r?\n/).join("|"), "ci --ignore-scripts --no-audit --no-fund|ci --ignore-scripts --no-audit --no-fund|run typecheck|test|run build");
+    for (const fence of ['fixed-oauth.dpapi.pending', 'fixed-deploy-incomplete.json']) {
+      const current = await fixture();
+      writeFileSync(path.join(current.runtime, fence), '{"schemaVersion":1,"status":"incomplete"}');
+      const rejected = await current.run(shell, 'backup');
+      assert.notEqual(rejected.code, 0, rejected.output);
+      assert.equal(existsSync(path.join(current.root, '.backups')), false);
+      assert.equal(existsSync(path.join(current.runtime, fence)), true);
+    }
     for (const jobs of [{ version: 99, jobs: [] }, { version: 1, jobs: [{ job_id: "synthetic", status: "running" }] }, { version: 1, jobs: [{ job_id: "synthetic", status: "recovery_required" }] }]) {
       const current = await fixture();
       writeFileSync(path.join(current.runtime, "jobs.json"), JSON.stringify(jobs));
@@ -182,7 +200,7 @@ $Wrong = @(Get-ChildItem -LiteralPath ${quote(path.join(value.root, ".backups", 
   test(`${shell}: live gateway records and writer leases block setup and update without stopping unrelated processes`, { skip: process.platform !== "win32", timeout: 180_000 }, async context => {
     if (shell === "pwsh.exe" && (await command(shell, "$PSVersionTable.PSVersion.ToString()")).code !== 0) { context.skip("PowerShell 7 is unavailable"); return; }
     const value = await fixture();
-    for (const name of ["gateway.json", "secure-tunnel-process.json"]) {
+    for (const name of ["gateway.json", "secure-tunnel-process.json", "fixed-gateway-process.json"]) {
       writeFileSync(path.join(value.runtime, name), JSON.stringify({ pid: process.pid }));
       for (const action of ["setup", "update", "backup"]) {
         const rejected = await value.run(shell, action);
@@ -192,7 +210,7 @@ $Wrong = @(Get-ChildItem -LiteralPath ${quote(path.join(value.root, ".backups", 
       }
       writeFileSync(path.join(value.runtime, name), JSON.stringify({ pid: 2147483647 }));
     }
-    for (const subdirectory of ["", "gateway-lease", "secure-tunnel-lease"]) {
+    for (const subdirectory of ["", "gateway-lease", "secure-tunnel-lease", "fixed-gateway-lease"]) {
       const directory = path.join(value.runtime, subdirectory);
       mkdirSync(directory, { recursive: true });
       const result = await command(shell, `

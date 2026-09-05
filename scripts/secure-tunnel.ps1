@@ -4,7 +4,9 @@ param(
   [string]$TunnelId,
   [ValidateRange(1024,65534)][int]$HealthPort=8796,
   [string]$ZeroCostEvidenceUrl,
-  [switch]$ConfirmZeroAddedCost
+  [switch]$ConfirmZeroAddedCost,
+  [ValidateSet('free-service','free-tier','free-credits')][string]$CostBasis='free-service',
+  [string]$EvidenceExpiresAt
 )
 $ErrorActionPreference='Stop'
 . (Join-Path $PSScriptRoot 'local-common.ps1')
@@ -23,7 +25,10 @@ try {
     if ([string]::IsNullOrWhiteSpace($TunnelId)) { throw 'Provide the existing Tunnel ID locally; do not create a replacement tunnel.' }
     if ([bool]$ConfirmZeroAddedCost -ne (-not [string]::IsNullOrWhiteSpace($ZeroCostEvidenceUrl))) { throw 'Provide both explicit zero-added-cost confirmation and its official evidence URL, or neither.' }
     $Values=@('configure',$TunnelId,[string]$HealthPort)
-    if ($ConfirmZeroAddedCost) { $Values+=@($ZeroCostEvidenceUrl,'confirmed') }
+    # Confirmation covers no new payment method, no charges/upgrade/recharge/
+    # purchases, and provider-enforced stop at quota exhaustion. It does not
+    # assert the entire service is permanently free.
+    if ($ConfirmZeroAddedCost) { $Values+=@($ZeroCostEvidenceUrl,'confirmed',$CostBasis,$EvidenceExpiresAt) }
     Invoke-SecureCommand $Values
     return
   }

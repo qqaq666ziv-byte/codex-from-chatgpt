@@ -3,6 +3,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { configuredTunnel, assertActivationAllowed, tunnelArguments, tunnelEnvironment, tunnelReadiness, lastSuccessfulPoll, verifyArchive } from '../src/secure-tunnel.js';
 import { matchesProcess, type OwnedProcess } from '../src/secure-process.js';
+import { assertCurrentCostEvidence, noChargeSafeguards } from '../src/cost-policy.js';
 
 const tunnelId = 'tunnel_' + 'a'.repeat(32);
 const runtime = path.resolve('.local-tests/synthetic tunnel 中文/.runtime');
@@ -34,6 +35,24 @@ test('isolated native environment excludes every inherited provider key and unsa
   assert.equal(env.CONTROL_PLANE_API_KEY, key);
   assert.equal(env.TUNNEL_CLIENT_STATE_DIR, path.join(runtime, 'secure-tunnel-state'));
   assert.throws(() => tunnelEnvironment({}, runtime, 'invalid\nsecret'));
+});
+
+test('free tiers and credits are eligible without a permanently free service, but all six safeguards are required', () => {
+  const tier = configuredTunnel(tunnelId, 8796, evidence, true, 'free-tier');
+  assert.doesNotThrow(() => assertActivationAllowed(tier));
+  const expires = new Date(Date.now() + 3600_000).toISOString();
+  const credit = configuredTunnel(tunnelId, 8796, evidence, true, 'free-credits', expires);
+  assert.doesNotThrow(() => assertActivationAllowed(credit));
+  assert.throws(() => configuredTunnel(tunnelId, 8796, evidence, true, 'free-credits'), /COST_UNVERIFIED/);
+  assert.throws(() => configuredTunnel(tunnelId, 8796, evidence, true, 'free-credits', '2020-01-01T00:00:00.000Z'), /expired/);
+  const safe = noChargeSafeguards();
+  for (const field of ['newPaymentMethodRequired', 'automaticCharges', 'automaticPaidUpgrade', 'autoRecharge', 'purchases'] as const) {
+    assert.throws(() => assertCurrentCostEvidence('free-tier', { ...safe, [field]: true }));
+  }
+  assert.throws(() => assertCurrentCostEvidence('free-tier', { ...safe, quotaExhaustion: 'bill-overage' }));
+  assert.throws(() => assertCurrentCostEvidence('free-credits', safe, expires, Date.parse(expires)), /expired/);
+  // Old bare approval is not sufficient evidence for the newly explicit terms.
+  assert.throws(() => assertCurrentCostEvidence('free-tier', undefined));
 });
 
 test('local green probes do not claim remote polling, ChatGPT E2E or fixed-entry completion', () => {

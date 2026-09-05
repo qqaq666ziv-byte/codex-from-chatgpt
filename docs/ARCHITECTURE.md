@@ -1,8 +1,8 @@
 # 架構與恢復規則
 
-一般 ChatGPT 的 MCP 工具經 Quick Tunnel HTTPS、本機 OAuth gateway 與經認證的 loopback HTTP 服務進入 AutoDev；本機 MCP 客戶端也可使用 stdio proxy。AutoDev 使用官方 Codex App Server 的 thread/turn 執行介面。沒有另外計費的 API 規劃者，也沒有自製聊天介面。
+一般 ChatGPT 的 MCP 工具經固定 Workers Free HTTPS、加密 relay、本機 OAuth gateway 與經認證的 loopback HTTP 服務進入 AutoDev；本機 MCP 客戶端也可使用 stdio proxy。AutoDev 使用官方 Codex App Server 的 thread/turn 執行介面，沿用既有訂閱登入。本次未採用另外計費的 API 規劃者，亦未建立自製聊天介面。
 
-0.4.1 在相同 OAuth gateway 前增加 Secure MCP Tunnel 候選 transport，仍受零新增費用關卡保護。它不更換 core 狀態機、不用 tunnel ID 當 reviewer identity；官方 transport 不能自行解決瀏覽器 OAuth 公開入口。完整決策及尚未驗收部分見 [SECURE-TUNNEL.md](SECURE-TUNNEL.md)。
+0.4.2 保留 core 狀態機，新增固定 issuer、每次程序獨立 AES-GCM relay key、私有 KV 到期路由與 DPAPI OAuth 保存。內部 Quick URL 改變不影響 App URL。Worker 可看見經授權的公開 HTTP 資料；加密 relay 防止舊內部 hostname 被重新分配後取得 bearer，不是對 Worker 隱藏用戶資料的加密。詳細威脅邊界及恢復見 [FIXED-ENTRY.md](FIXED-ENTRY.md)。0.4.1 的 Secure MCP Tunnel 仍是成本未確認的候選；不把 Tunnel 身分當 reviewer identity。
 
 ## 儲存與身分
 

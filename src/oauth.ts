@@ -1,4 +1,5 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { validateOAuthState, type OAuthStateStore, type OAuthPersistentState } from "./oauth-state.js";
 
 export type OAuthErrorCode = "invalid_request" | "invalid_client_metadata" | "invalid_redirect_uri" | "invalid_client" | "unauthorized_client" | "invalid_scope" | "invalid_target" | "invalid_grant" | "unsupported_grant_type" | "invalid_token" | "access_denied" | "temporarily_unavailable";
 export class OAuthError extends Error {
@@ -8,7 +9,7 @@ export class OAuthError extends Error {
   }
 }
 
-export type OAuthGateOptions = { issuer: string; now?: () => number };
+export type OAuthGateOptions = { issuer: string; now?: () => number; stateStore?: OAuthStateStore };
 export type OAuthPendingRequest = { request_id: string; verification_code: string; expires_at: string; client_name: string; scope: "autodev" };
 export type OAuthTokenResult = { access_token: string; token_type: "Bearer"; expires_in: number; refresh_token: string; scope: "autodev" };
 export type OAuthIdentity = { grant_id: string; client_id: string; resource: string; scope: "autodev"; expires_at: string };
@@ -67,10 +68,12 @@ function shortCode(): string {
 }
 
 /**
- * Single-user development OAuth authority; all grants die with this instance.
+ * Single-user OAuth authority; default grants die with this instance. A fixed
+ * issuer may explicitly opt into an encrypted, leased persistent state store.
  * The gateway MUST expose localApproval/pendingRequests only through its
  * authenticated local admin channel, never through public OAuth HTTP routes.
- * No OpenAI API key, hosted identity service or persistent token file is used.
+ * No OpenAI API key or hosted identity service is used. Persistence stores only
+ * encrypted token hashes; pending requests and unredeemed codes remain volatile.
  * DCR public clients + PKCE follow the documented ChatGPT MCP auth contract:
  * https://developers.openai.com/plugins/build/auth
  * This deliberately does not advertise CIMD or accept arbitrary redirect URLs.
@@ -79,6 +82,8 @@ export class OAuthGate {
   readonly issuer: string;
   readonly resource: string;
   private readonly clock: () => number;
+  private readonly stateStore?: OAuthStateStore;
+  private storageFailed = false;
   private lastNow = 0;
   private readonly clients = new Map<string, Client>();
   private readonly consents = new Map<string, Consent>();
@@ -99,6 +104,19 @@ export class OAuthGate {
     } catch { failure("invalid_request", "OAuth issuer must be one canonical HTTPS origin"); }
     this.resource = `${this.issuer}/mcp`;
     this.clock = options.now ?? Date.now;
+    this.stateStore = options.stateStore;
+    if (this.stateStore) {
+      const now = this.prepare();
+      const loaded = this.stateStore.load(this.issuer, now);
+      if (loaded) {
+        const state = validateOAuthState(loaded, this.issuer, now);
+        for (const client of state.clients) this.clients.set(client.id, client);
+        for (const grant of state.grants) this.grants.set(grant.id, grant);
+        for (const name of ["accessTokens", "refreshTokens", "usedRefresh", "usedCodes"] as const) for (const [key, ref] of state[name]) this[name].set(key, ref);
+        this.lastNow = Math.max(this.lastNow, state.writtenAt);
+        this.prepare();
+      }
+    }
   }
 
   metadata() {
@@ -123,12 +141,14 @@ export class OAuthGate {
     if (body.response_types !== undefined && (!Array.isArray(body.response_types) || body.response_types.length !== 1 || body.response_types[0] !== "code")) failure("invalid_client_metadata", "Only the authorization code response type is supported");
     const name = body.client_name ?? "ChatGPT";
     if (typeof name !== "string" || name.trim().length === 0 || name.length > 120 || /[\x00-\x1f\x7f]/.test(name)) failure("invalid_client_metadata", "Client name must be bounded display text");
-    if (this.clients.size >= CAPACITY) failure("temporarily_unavailable", "Development client capacity reached; restart the gateway to register more connections", 503);
+    if (this.clients.size >= CAPACITY) failure("temporarily_unavailable", this.stateStore ? "OAuth client capacity reached; local authorization-state maintenance is required" : "Development client capacity reached; restart the gateway to register more connections", 503);
     const id = opaque();
     const redirects = [...body.redirect_uris] as string[];
     // ChatGPT reuses DCR client_id for this connection, including reauthorization.
-    // Clients therefore live for this process; tokens retain bounded lifetimes.
+    // A configured fixed-issuer store preserves clients across process restarts;
+    // all token lifetimes and refresh limits retain their original bounds.
     this.clients.set(id, { id, name, redirects });
+    this.persist(now);
     return { client_id: id, client_id_issued_at: Math.floor(now / 1000), client_name: name, redirect_uris: [...redirects], token_endpoint_auth_method: "none" as const, grant_types: ["authorization_code", "refresh_token"], response_types: ["code"] };
   }
 
@@ -215,7 +235,7 @@ export class OAuthGate {
     if (!/^[A-Za-z0-9._~-]{43,128}$/.test(form.code_verifier!) || !/^[A-Za-z0-9_-]{43}$/.test(form.code!)) failure("invalid_grant", "Authorization code or PKCE verifier is invalid");
     const codeHash = digest(form.code!);
     const reused = this.usedCodes.get(codeHash);
-    if (reused) { this.revoke(reused.grantId); failure("invalid_grant", "Authorization code has already been used; its grant was revoked"); }
+    if (reused) { this.revoke(reused.grantId); this.persist(now); failure("invalid_grant", "Authorization code has already been used; its grant was revoked"); }
     const requestId = this.codes.get(codeHash);
     const consent = requestId ? this.consents.get(requestId) : undefined;
     const challenge = createHash("sha256").update(form.code_verifier!).digest("base64url");
@@ -237,11 +257,11 @@ export class OAuthGate {
     if (!/^[A-Za-z0-9_-]{43}$/.test(form.refresh_token!)) failure("invalid_grant", "Refresh token is invalid");
     const tokenHash = digest(form.refresh_token!);
     const reused = this.usedRefresh.get(tokenHash);
-    if (reused) { this.revoke(reused.grantId); failure("invalid_grant", "Refresh token replay detected; its grant was revoked"); }
+    if (reused) { this.revoke(reused.grantId); this.persist(now); failure("invalid_grant", "Refresh token replay detected; its grant was revoked"); }
     const ref = this.refreshTokens.get(tokenHash);
     const grant = ref ? this.grants.get(ref.grantId) : undefined;
     if (!ref || !grant || ref.expiresAt <= now || grant.clientId !== client.id) failure("invalid_grant", "Refresh token is invalid, expired or bound to another client");
-    if (grant.rotations >= MAX_ROTATIONS) { this.revoke(grant.id); failure("invalid_grant", "Development refresh rotation limit reached; reconnect with local approval"); }
+    if (grant.rotations >= MAX_ROTATIONS) { this.revoke(grant.id); this.persist(now); failure("invalid_grant", "Development refresh rotation limit reached; reconnect with local approval"); }
     this.refreshTokens.delete(tokenHash);
     this.usedRefresh.set(tokenHash, ref);
     grant.rotations++;
@@ -254,6 +274,7 @@ export class OAuthGate {
     const expiresAt = Math.min(now + ACCESS_MS, grant.expiresAt);
     this.accessTokens.set(digest(access), { grantId: grant.id, expiresAt });
     this.refreshTokens.set(digest(refresh), { grantId: grant.id, expiresAt: grant.expiresAt });
+    this.persist(now);
     return { access_token: access, token_type: "Bearer", expires_in: Math.floor((expiresAt - now) / 1000), refresh_token: refresh, scope: "autodev" };
   }
 
@@ -288,17 +309,33 @@ export class OAuthGate {
   }
 
   private prepare(rate?: string, maximum = 0): number {
+    if (this.storageFailed) failure("temporarily_unavailable", "OAuth authorization storage requires local recovery", 503);
     const current = this.clock();
     if (!Number.isSafeInteger(current) || current < 0) failure("temporarily_unavailable", "Gateway clock is unavailable", 503);
     const now = this.lastNow = Math.max(this.lastNow, current);
+    const previousSize = this.durableSize();
     for (const [id, consent] of this.consents) if (consent.expiresAt <= now) { this.consents.delete(id); if (consent.codeHash) this.codes.delete(consent.codeHash); }
     for (const [id, grant] of this.grants) if (grant.expiresAt <= now) this.revoke(id);
     for (const index of [this.accessTokens, this.refreshTokens, this.usedRefresh, this.usedCodes]) for (const [key, ref] of index) if (ref.expiresAt <= now) index.delete(key);
+    if (this.durableSize() !== previousSize) this.persist(now);
     if (rate) {
       let bucket = this.rates.get(rate);
       if (!bucket || now - bucket.since >= 60_000) { bucket = { since: now, count: 0 }; this.rates.set(rate, bucket); }
       if (++bucket.count > maximum) failure("temporarily_unavailable", "Development OAuth request rate exceeded; wait before retrying", 429);
     }
     return now;
+  }
+
+  private durableSize(): number { return this.grants.size + this.accessTokens.size + this.refreshTokens.size + this.usedRefresh.size + this.usedCodes.size; }
+
+  private persist(now: number): void {
+    if (!this.stateStore) return;
+    const state: OAuthPersistentState = { schemaVersion: 1, issuer: this.issuer, writtenAt: now, clients: [...this.clients.values()], grants: [...this.grants.values()],
+      accessTokens: [...this.accessTokens], refreshTokens: [...this.refreshTokens], usedRefresh: [...this.usedRefresh], usedCodes: [...this.usedCodes] };
+    try { this.stateStore.save(state); }
+    catch {
+      this.storageFailed = true;
+      failure("temporarily_unavailable", "OAuth authorization state could not be committed; local recovery is required", 503);
+    }
   }
 }

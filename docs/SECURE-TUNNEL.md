@@ -1,6 +1,8 @@
 # Secure Tunnel 候選入口與 Windows 交付
 
-2026-09-05，AutoDev 0.4.1，延續 `codex/autodev-product` 的 `cc18c408f1431336f4ba673c4d26c81b68aa4f91`。
+2026-09-05，AutoDev 0.4.1 的 Secure Tunnel 候選交付紀錄，延續 `codex/autodev-product` 的 `cc18c408f1431336f4ba673c4d26c81b68aa4f91`。
+
+0.4.2 已另外加入免費 Cloudflare 固定入口與 OAuth 持久化，見 [FIXED-ENTRY.md](FIXED-ENTRY.md)。成本要求以使用者最新修正的 [COST-POLICY.md](COST-POLICY.md) 為準：API、免費 credits、免費 quota 皆可用，只要六項零新增實際費用條件成立。以下未驗證項目描述 0.4.1 當時的 Secure Tunnel 路徑，不代表 0.4.2 的驗收結果。
 
 本版已實作候選 transport、Windows 管理與測試，**尚未成為固定日常入口**。啟用被成本關卡阻擋；即使解除成本關卡，OAuth 瀏覽器授權入口仍須完成固定化及一般 ChatGPT 驗收。Quick Tunnel 和歷史 jobs/evidence/reviews 保留。不能把下列本機原生測試當作新 ChatGPT E2E。
 
@@ -35,11 +37,13 @@ configure 只保存 `.runtime/secure-tunnel.json`，預設 `cost.status=unverifi
 
 ```powershell
 # 先取得官方零新增費用確認；未確認時不要執行以下步驟。
-pwsh.exe -NoProfile -File .\scripts\secure-tunnel.ps1 configure -TunnelId '同一個既有Tunnel-ID' -ZeroCostEvidenceUrl '適用的官方文件或支援回覆網址' -ConfirmZeroAddedCost
+pwsh.exe -NoProfile -File .\scripts\secure-tunnel.ps1 configure -TunnelId '同一個既有Tunnel-ID' -ZeroCostEvidenceUrl '適用的官方文件或支援回覆網址' -CostBasis free-tier -ConfirmZeroAddedCost
 pwsh.exe -NoProfile -File .\scripts\secure-tunnel.ps1 credential
 ```
 
 credential 只在本機以隱藏輸入接收受限制的 runtime key，保存 Windows current-user DPAPI 密文及私人 ACL。勿把 key 貼進聊天；不使用 admin key。key principal 只需要 Tunnels Read + Use；不啟用模型權限或付費項目。[官方權限](https://github.com/openai/tunnel-client/blob/v0.0.14/docs/permissions.md)
+
+0.4.2 的 `ConfirmZeroAddedCost` 同時確認六項限制；`CostBasis` 可選 `free-service`、`free-tier`、`free-credits`。credits 必須另填 `EvidenceExpiresAt`（ISO UTC），到期停止；不要求服務永久免費。尚未找到適用 Secure Tunnel 的充分證據，所以此候選仍未啟用。
 
 啟用、configure 與 credential 儲存共用生命週期 mutex。start 必須在鎖內重新驗證成本、binary、既有 core 與 OAuth gateway 程序身分後，才解密 credential。原生子程序環境從白名單建立，排除繼承的 OPENAI_API_KEY、admin key、profile、proxy credential 與不安全 logging 設定。
 

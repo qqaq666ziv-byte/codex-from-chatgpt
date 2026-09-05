@@ -1,4 +1,4 @@
-# Offline runtime snapshots. Import has no side effects; callers hold both writer leases.
+# Offline runtime snapshots. Import has no side effects; callers hold every writer lease.
 function Get-AutoDevFileDigest([string]$File) {
   $Stream = [IO.File]::OpenRead($File)
   $Hasher = [Security.Cryptography.SHA256]::Create()
@@ -65,6 +65,11 @@ try {
   }
   const secure = read('secure-tunnel.json');
   if (secure !== undefined && (!object(secure) || secure.schemaVersion !== 1)) throw 1;
+  const fixed = read('fixed-tunnel.json');
+  if (fixed !== undefined && (!object(fixed) || fixed.schemaVersion !== 1)) throw 1;
+  // A failed durable OAuth mutation is not an idle, restorable authorization.
+  if (fs.existsSync(path.join(root,'fixed-oauth.dpapi.pending'))) throw 1;
+  if (fs.existsSync(path.join(root,'fixed-deploy-incomplete.json'))) throw 1;
   const build = read('build-incomplete.json');
   if (build !== undefined && (!object(build) || build.schemaVersion !== 1 || build.status !== 'incomplete')) throw 1;
   process.stdout.write('OK');
@@ -77,9 +82,9 @@ try {
 
 function Test-AutoDevBackupExcluded([string]$Relative) {
   $Parts = $Relative -split '[\\/]'
-  if (@($Parts | Where-Object { $_ -in @('gateway-lease', 'secure-tunnel-lease', 'logs') }).Count -gt 0) { return $true }
+  if (@($Parts | Where-Object { $_ -in @('gateway-lease', 'secure-tunnel-lease', 'fixed-gateway-lease', 'cloudflare-cli', 'logs') }).Count -gt 0) { return $true }
   $Name = $Parts[-1]
-  return $Name -in @('server-process.json', 'gateway.json', 'secure-tunnel-process.json', 'secure-tunnel-client.yml', 'os-writer.lock') -or $Name -match '(?i)(\.log|\.tmp|\.bak|\.lock)$' -or $Name -like 'quick-tunnel-*.yml'
+  return $Name -in @('server-process.json', 'gateway.json', 'secure-tunnel-process.json', 'fixed-gateway-process.json', 'secure-tunnel-client.yml', 'fixed-cloudflared.yml', 'fixed-tunnel-client.yml', 'os-writer.lock') -or $Name -match '(?i)(\.log|\.tmp|\.bak|\.lock)$' -or $Name -like 'quick-tunnel-*.yml'
 }
 
 function Get-AutoDevBackupFiles([string]$Directory) {
@@ -164,6 +169,14 @@ function Restore-AutoDevBackup([string]$Root, [string]$Runtime, [string]$BackupI
   Assert-AutoDevOfflineState $Staged
   $SourceFiles = @(Get-AutoDevBackupFiles (Join-Path $Directory 'runtime'))
   if (($SourceFiles | ConvertTo-Json -Depth 5 -Compress) -ne (@(Get-AutoDevBackupFiles $Staged) | ConvertTo-Json -Depth 5 -Compress)) { throw 'Staged restore did not pass checksum verification; runtime was preserved.' }
+  # Restoring an old authorization snapshot could revive a rotated or revoked
+  # refresh token. Preserve it as encrypted evidence, never as active authority.
+  $RestoredOAuth = Join-Path $Staged 'fixed-oauth.dpapi'
+  if (Test-Path -LiteralPath $RestoredOAuth -PathType Leaf) {
+    $OAuthEvidence = Join-Path $Staged ('fixed-oauth-restored-' + [Guid]::NewGuid().ToString('N') + '.dpapi')
+    Move-Item -LiteralPath $RestoredOAuth -Destination $OAuthEvidence -ErrorAction Stop
+    Write-Output 'Previous OAuth snapshot retained as encrypted evidence; reconnect the fixed App after restore. Old grants were not reactivated.'
+  }
   # A runtime snapshot does not restore source or dependencies. Require a
   # successful rebuild of the selected source before dispatching saved work.
   Write-AutoDevAtomicText (Join-Path $Staged 'build-incomplete.json') ('{"schemaVersion":1,"status":"incomplete"}')

@@ -26,7 +26,7 @@ $ExplicitPortRequested = $PSBoundParameters.ContainsKey('Port')
 
 function Assert-AutoDevStoppedForBuild {
   if (Test-Path -LiteralPath $Runtime) { Assert-AutoDevPhysicalTree $Runtime }
-  foreach ($Name in @('server-process.json', 'gateway.json', 'secure-tunnel-process.json')) {
+  foreach ($Name in @('server-process.json', 'gateway.json', 'secure-tunnel-process.json', 'fixed-gateway-process.json')) {
     $Record = Read-AutoDevProcessRecord (Join-Path $Runtime $Name)
     if ($Record -and (Get-AutoDevProcessInfo ([int]$Record.pid))) {
       throw 'Maintenance requires the core and every managed connection to be stopped. Check status and reconcile active work first. No process was stopped or built files changed.'
@@ -51,7 +51,7 @@ function Invoke-AutoDevMaintenance([scriptblock]$Operation) {
     if (Test-Path -LiteralPath $Runtime -PathType Container) {
       Assert-AutoDevPhysicalTree $Runtime
       $Leases += Enter-AutoDevOfflineLease $Runtime
-      foreach ($Name in @('gateway-lease', 'secure-tunnel-lease')) {
+      foreach ($Name in @('gateway-lease', 'secure-tunnel-lease', 'fixed-gateway-lease')) {
         $LeaseDirectory = Join-Path $Runtime $Name
         # Reserve even absent lease directories: a concurrently launched gateway
         # must acquire this same mutex before creating its public connection.

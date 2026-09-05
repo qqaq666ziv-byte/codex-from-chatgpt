@@ -1,6 +1,6 @@
 {
   "name": "autodev",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "private": true,
   "description": "Local Codex execution and versioned review evidence for ordinary ChatGPT Chat",
   "license": "MIT",
@@ -13,7 +13,7 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/src/index.js",
     "dev": "tsx src/index.ts",
-    "test": "tsx --test test/*.test.ts",
+    "test": "tsx --test test/*.test.ts && node --test edge/test/*.test.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "check": "npm run typecheck && npm test && npm run build",
     "test:real": "tsx scripts/real-smoke.ts",
