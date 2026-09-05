@@ -27,7 +27,7 @@ export type ApprovalDecision =
   | PermissionsRequestApprovalResponse
   | ReviewDecision;
 
-type ApprovalKind = "command_execution" | "file_change" | "permissions";
+type ApprovalKind = "command_execution" | "file_change" | "permissions" | "user_input";
 
 type PendingApproval = {
   requestId: JsonRpcId;
@@ -37,6 +37,7 @@ type PendingApproval = {
   turnId: string;
   itemId: string;
   params: JsonObject;
+  expiresAt: string;
 };
 
 type JobRecord = {
@@ -60,6 +61,8 @@ type JobRecord = {
   completionReportInjected: boolean;
   revisionFingerprint: string;
   updatedAt: string;
+  effectiveConfig: Record<string, unknown>;
+  evidenceItems: JsonObject[];
 };
 
 export type JobDetail = "compact" | "standard" | "debug";
@@ -97,6 +100,8 @@ type TurnCapture = {
 };
 
 export type PendingApprovalView = {
+  expires_at?: string;
+  questions?: unknown;
   request_id: JsonRpcId;
   kind: ApprovalKind;
   method: string;
@@ -146,6 +151,7 @@ export type JobGetOptions = {
 };
 
 export type JobManagerOptions = {
+  workspaceValidator?: (workspace: string) => Promise<string>;
   store?: StateStore;
   model?: string;
   reasoningEffort?: string;
@@ -177,11 +183,13 @@ function boundedList<T>(values: T[], limit: number): { values: T[]; truncated: b
 }
 
 function validationKinds(command: string): ValidationKind[] {
-  const value = command.trim().toLowerCase();
+  // App Server may report a full Windows shell invocation around the script.
+  const value = command.trim().toLowerCase().replace(/^(?:&\s+)?(?:["'][^"'\r\n]*[\\/](?:powershell|pwsh)\.exe["']|(?:powershell|pwsh)(?:\.exe)?)\s+(?:(?:-noprofile|-noninteractive|-nol(?:ogo)?)\s+)*-(?:command|c)\s+["']?/i, "");
   const kinds: ValidationKind[] = [];
   const add = (kind: ValidationKind, condition: boolean): void => { if (condition && !kinds.includes(kind)) kinds.push(kind); };
-  const packageRunner = "(?:npm|pnpm|yarn|bun)\\s+(?:(?:run|exec)\\s+)?";
+  const packageRunner = "(?:npm|pnpm|yarn|bun)(?:\\.cmd|\\.exe)?\\s+(?:(?:run|exec)\\s+)?";
   add("test", new RegExp(`(?:^|[;&|]\\s*)${packageRunner}test\\b|(?:^|[;&|]\\s*)(?:pytest|cargo\\s+test|go\\s+test|mvn\\s+test|gradle\\s+test)\\b`).test(value));
+  add("test", /^(?:&\s+)?(?:node(?:\.exe)?|"[^"\r\n]*[\\/]node\.exe")\s+--test(?:\s|["']|$)/.test(value));
   add("typecheck", new RegExp(`(?:^|[;&|]\\s*)${packageRunner}(?:typecheck|type-check|check:types)\\b|(?:^|[;&|]\\s*)tsc\\b[\\s\\S]*--noEmit\\b`).test(value));
   add("build", new RegExp(`(?:^|[;&|]\\s*)${packageRunner}(?:build|compile)\\b|(?:^|[;&|]\\s*)tsc\\b[\\s\\S]*-p\\b`).test(value));
   add("lint", new RegExp(`(?:^|[;&|]\\s*)${packageRunner}lint\\b|(?:^|[;&|]\\s*)(?:eslint|biome\\s+check|ruff\\s+check)\\b`).test(value));
@@ -427,6 +435,8 @@ function approvalView(approval: PendingApproval): PendingApprovalView {
       ? ["accept", "acceptForSession", "decline", "cancel"]
       : ["accept", "acceptForSession", "acceptWithExecpolicyAmendment", "applyNetworkPolicyAmendment", "decline", "cancel"];
   const view: PendingApprovalView = {
+    expires_at: approval.expiresAt,
+    ...(approval.kind === "user_input" ? { questions: params.questions } : {}),
     request_id: approval.requestId,
     kind: approval.kind,
     method: approval.method,
@@ -456,6 +466,7 @@ function approvalSummaryView(approval: PendingApproval): PendingApprovalSummary 
 }
 
 export class JobManager {
+  private readonly workspaceValidator: (workspace: string) => Promise<string>;
   private readonly jobs = new Map<string, JobRecord>();
   private readonly jobsByThread = new Map<string, string>();
   private readonly turnCaptures = new Map<string, TurnCapture>();
@@ -468,6 +479,7 @@ export class JobManager {
   private operation: Promise<void> = Promise.resolve();
 
   constructor(private readonly appServer: AppServerClient, options: JobManagerOptions = {}) {
+    this.workspaceValidator = options.workspaceValidator ?? validateWorkspace;
     this.store = options.store ?? new StateStore();
     this.model = options.model ?? (process.env.CODEX_AGENT_MODEL?.trim() || undefined);
     this.reasoningEffort = options.reasoningEffort ?? (process.env.CODEX_AGENT_REASONING_EFFORT?.trim() || undefined);
@@ -482,18 +494,20 @@ export class JobManager {
     });
   }
 
-  async start(workspace: string, prompt: string): Promise<JobStartResult> {
-    const canonicalWorkspace = await validateWorkspace(workspace);
+  async start(workspace: string, prompt: string, requestedJobId?: string): Promise<JobStartResult> {
+    const canonicalWorkspace = await this.workspaceValidator(workspace);
     this.validatePrompt(prompt);
     return this.withExclusive(async () => {
       await this.ensureReady();
       this.assertNoActiveTurn();
+      if (requestedJobId && this.jobs.has(requestedJobId)) throw new Error("Job identity already exists; inspect it instead of dispatching again.");
       const job: JobRecord = {
-        jobId: randomUUID(), threadId: null, workspace: canonicalWorkspace, turnId: null, status: "starting",
+        jobId: requestedJobId ?? randomUUID(), threadId: null, workspace: canonicalWorkspace, turnId: null, status: "starting",
         finalMessage: null, latestDiff: null, filesChanged: [], commandsExecuted: [], error: null,
         pendingApprovals: new Map(), lastAgentMessage: null, agentMessages: new Map(), revision: 0,
         activity: "Starting Codex", validation: [], warnings: [], completionReportInjected: false,
         revisionFingerprint: "", updatedAt: new Date().toISOString(),
+        effectiveConfig: {}, evidenceItems: [],
       };
       this.touch(job);
       this.jobs.set(job.jobId, job);
@@ -502,6 +516,7 @@ export class JobManager {
         if (!this.persist(job, true)) throw new Error("No se pudo persistir el job antes de crear el thread.");
         const response = await this.appServer.request<unknown>("thread/start", {
           ...(this.model ? { model: this.model } : {}),
+          ...(this.reasoningEffort ? { config: { model_reasoning_effort: this.reasoningEffort } } : {}),
           cwd: canonicalWorkspace,
           approvalPolicy: "on-request",
           approvalsReviewer: "user",
@@ -510,6 +525,12 @@ export class JobManager {
         const thread = isObject(response) && isObject(response.thread) ? response.thread : null;
         const threadId = requiredString(thread?.id, "thread.id");
         this.attachThread(job, threadId);
+        if (isObject(response)) {
+          job.effectiveConfig = { model: response.model ?? null, reasoningEffort: response.reasoningEffort ?? null, approvalPolicy: response.approvalPolicy ?? null, sandbox: response.sandbox ?? null };
+          if ((this.model && response.model !== this.model) || (this.reasoningEffort && response.reasoningEffort !== this.reasoningEffort)) {
+            throw new Error("Effective model/effort differs from requested configuration; execution was not started.");
+          }
+        }
         this.persist(job, true);
         await this.startTurn(job, prompt);
       } catch (error) {
@@ -541,6 +562,17 @@ export class JobManager {
       if (job.threadId === null) throw new Error("el job aún no tiene un thread confirmado; requiere reconciliación.");
       this.activeJobId = job.jobId;
       try {
+        await this.workspaceValidator(job.workspace);
+        const resumed = await this.appServer.request<unknown>("thread/resume", {
+          threadId: job.threadId, cwd: job.workspace,
+          ...(this.model ? {model:this.model} : {}),
+          ...(this.reasoningEffort ? {config:{model_reasoning_effort:this.reasoningEffort}} : {}),
+          approvalPolicy:"on-request", approvalsReviewer:"user", sandbox:"workspace-write",
+        });
+        if (!isObject(resumed) || !isObject(resumed.thread) || resumed.thread.id !== job.threadId) throw new Error("thread/resume did not confirm the same thread.");
+        if ((this.model && resumed.model !== this.model) || (this.reasoningEffort && resumed.reasoningEffort !== this.reasoningEffort)) throw new Error("Resumed model/effort differs from configured execution; turn not started.");
+        job.effectiveConfig={model:resumed.model??null,reasoningEffort:resumed.reasoningEffort??null,approvalPolicy:resumed.approvalPolicy??null,sandbox:resumed.sandbox??null};
+        if (Array.isArray(resumed.thread.turns) && resumed.thread.turns.some(turn => isObject(turn) && turn.status === "inProgress")) throw new Error("Resumed thread has an unresolved active turn.");
         await this.startTurn(job, prompt);
       } catch (error) {
         this.setFailure(job, error, true);
@@ -583,6 +615,8 @@ export class JobManager {
       const job = this.getJob(jobId);
       const approval = job.pendingApprovals.get(idKey(requestId));
       if (!approval) throw new Error(`no existe una approval pendiente con request_id=${String(requestId)} para este job.`);
+      if (Date.parse(approval.expiresAt) <= Date.now()) throw new Error("Approval expired; cancel the turn and request a fresh decision.");
+      if (approval.kind === "user_input") throw new Error("Use respondUserInput for a product question.");
       if (!(approval.method === "applyPatchApproval" || approval.method === "execCommandApproval" ? isLegacyApprovalDecision(decision) : isApprovalDecisionFor(approval.kind, decision))) {
         throw new Error(`decision no admitida para una approval de tipo ${approval.kind}.`);
       }
@@ -617,6 +651,33 @@ export class JobManager {
     return this.standardSnapshot(job);
   }
 
+  list(): JobSnapshot[] { return [...this.jobs.keys()].map(id => this.get(id)); }
+
+  /** Untruncated, persisted execution evidence. No arbitrary filesystem access. */
+  evidence(jobId: string) {
+    const job = this.getJob(jobId);
+    return structuredClone({ job_id: job.jobId, thread_id: job.threadId, turn_id: job.turnId,
+      revision: job.revision, status: job.status, final_message: job.finalMessage,
+      latest_diff: job.latestDiff, files_changed: job.filesChanged, validation: job.validation,
+      effective_config: job.effectiveConfig, items: job.evidenceItems });
+  }
+
+  async respondUserInput(jobId: string, requestId: JsonRpcId, answers: Record<string, { answers: string[] }>): Promise<JobSnapshot> {
+    return this.withExclusive(async () => {
+      const job = this.getJob(jobId);
+      const pending = job.pendingApprovals.get(idKey(requestId));
+      if (!pending || pending.kind !== "user_input" || Date.parse(pending.expiresAt) <= Date.now()) throw new Error("Unknown, stale or expired product question.");
+      const questions = Array.isArray(pending.params.questions) ? pending.params.questions.filter(isObject) : [];
+      const ids = questions.map(q => requiredString(q.id, "question.id"));
+      if (Object.keys(answers).length !== ids.length || !ids.every(id => Array.isArray(answers[id]?.answers) && answers[id]!.answers.length > 0 && answers[id]!.answers.every(a => typeof a === "string" && a.length > 0))) throw new Error("Answers must exactly match all question IDs.");
+      this.appServer.respond(requestId, { answers });
+      job.pendingApprovals.delete(idKey(requestId));
+      if (job.pendingApprovals.size === 0) { job.status = "running"; job.activity = "Codex is working"; }
+      this.touch(job); this.persist(job, true);
+      return this.snapshot(job);
+    });
+  }
+
   private async withExclusive<T>(operation: () => Promise<T>): Promise<T> {
     const previous = this.operation;
     let release!: () => void;
@@ -630,6 +691,7 @@ export class JobManager {
   }
 
   private async ensureReady(): Promise<void> {
+    if (this.store.getDiagnostic()) throw new Error("Persisted job state is corrupt or unavailable; restore a verified backup before dispatch.");
     await this.appServer.start();
     if (!this.rehydrated || this.recoveryFence) {
       await this.rehydrate();
@@ -652,35 +714,58 @@ export class JobManager {
 
   private async reconcileJob(job: JobRecord, mayResume: boolean): Promise<void> {
     try {
-      job.workspace = await validateWorkspace(job.workspace);
-      const response = await this.appServer.request<unknown>("thread/read", { threadId: job.threadId, includeTurns: true });
+      // A response lost before turn/start returned has no authoritative turn
+      // identity. Never infer that identity from the thread's newest work.
+      const expectedThreadId = job.threadId;
+      const expectedTurnId = job.turnId;
+      if (!expectedThreadId || !expectedTurnId) throw new Error("Recovery requires an already confirmed thread_id and turn_id; unknown turns are not adopted.");
+      const exactLatestTurn = (thread: JsonObject, method: string): JsonObject => {
+        if (thread.id !== expectedThreadId) throw new Error(`${method} did not confirm the saved thread.`);
+        const turns = Array.isArray(thread.turns) ? thread.turns : [];
+        const latest = turns.at(-1);
+        if (!isObject(latest) || latest.id !== expectedTurnId ||
+            turns.filter(turn => isObject(turn) && turn.id === expectedTurnId).length !== 1 ||
+            turns.some(turn => isObject(turn) && turn.id !== expectedTurnId && turn.status === "inProgress")) {
+          throw new Error(`${method} did not confirm the exact saved turn as the latest turn; unknown turns are not adopted.`);
+        }
+        if (latest.status !== "inProgress" && !isTerminal(latest.status)) throw new Error(`${method} returned an unrecognized state for the saved turn.`);
+        return latest;
+      };
+      job.workspace = await this.workspaceValidator(job.workspace);
+      const response = await this.appServer.request<unknown>("thread/read", { threadId: expectedThreadId, includeTurns: true });
       const thread = isObject(response) && isObject(response.thread) ? response.thread : null;
-      if (!thread || stringValue(thread.id) !== job.threadId) throw new Error("thread/read devolvió un thread distinto.");
-      const turns = Array.isArray(thread.turns) ? thread.turns.filter(isObject) : [];
-      const latest = turns.at(-1);
-      if (latest) this.applyStoredTurn(job, latest);
-      const latestStatus = stringValue(latest?.status);
+      if (!thread) throw new Error("thread/read did not return the saved thread.");
+      const latest = exactLatestTurn(thread, "thread/read");
+      const latestStatus = latest.status;
       if (latestStatus === "inProgress") {
         if (!mayResume || this.activeJobId !== null && this.activeJobId !== job.jobId) {
           this.setRecoveryRequired(job, new Error("hay más de un turn activo persistido; la política V0.2 permite uno por proceso."));
           return;
         }
-        const expectedTurnId = requiredString(latest?.id, "turn.id");
-        const resumed = await this.appServer.request<unknown>("thread/resume", { threadId: job.threadId });
+        const resumed = await this.appServer.request<unknown>("thread/resume", {
+          threadId: expectedThreadId, cwd: job.workspace,
+          ...(this.model ? { model: this.model } : {}),
+          ...(this.reasoningEffort ? { config: { model_reasoning_effort: this.reasoningEffort } } : {}),
+          approvalPolicy: "on-request", approvalsReviewer: "user", sandbox: "workspace-write",
+        });
         const resumedThread = isObject(resumed) && isObject(resumed.thread) ? resumed.thread : null;
-        if (!resumedThread || stringValue(resumedThread.id) !== job.threadId) throw new Error("thread/resume no confirmó el thread.");
-        const resumedTurns = Array.isArray(resumedThread.turns) ? resumedThread.turns.filter(isObject) : [];
-        const resumedTurn = resumedTurns.find((turn) => stringValue(turn.id) === expectedTurnId);
-        if (!resumedTurn || stringValue(resumedTurn.status) !== "inProgress") throw new Error("thread/resume no confirmó el mismo turn inProgress.");
+        if (!resumedThread) throw new Error("thread/resume did not return the saved thread.");
+        const resumedTurn = exactLatestTurn(resumedThread, "thread/resume");
+        if (!isObject(resumed) || (this.model && resumed.model !== this.model) || (this.reasoningEffort && resumed.reasoningEffort !== this.reasoningEffort)) {
+          throw new Error("Resumed model/effort differs from configured recovery; turn remains blocked.");
+        }
+        job.effectiveConfig = { model: resumed.model ?? null, reasoningEffort: resumed.reasoningEffort ?? null, approvalPolicy: resumed.approvalPolicy ?? null, sandbox: resumed.sandbox ?? null };
         if (isTerminal(job.status) || job.turnId !== expectedTurnId) return;
+        if (isTerminal(resumedTurn.status)) {
+          this.applyTerminalStatus(job, resumedTurn.status, resumedTurn);
+          return;
+        }
+        this.recordTurnItems(job, resumedTurn);
         job.status = "running";
-        job.turnId = expectedTurnId;
         if (!job.activity) job.activity = "Codex is working";
         this.activeJobId = job.jobId;
-      } else if (latest && latestStatus && isTerminal(latestStatus)) {
+      } else if (isTerminal(latestStatus)) {
         this.applyTerminalStatus(job, latestStatus, latest);
-      } else if (isActiveStatus(job.status) || job.status === "recovery_required") {
-        this.setRecoveryRequired(job, new Error("thread/read no permitió determinar el estado final del turn."));
       }
       this.touch(job);
       this.persist(job);
@@ -708,6 +793,7 @@ export class JobManager {
       activity: value.activity ?? null, validation, warnings: [...(value.warnings ?? [])],
       completionReportInjected: value.completion_report_injected ?? false,
       revisionFingerprint: "", updatedAt: value.updated_at,
+      effectiveConfig: value.effective_config ?? {}, evidenceItems: value.evidence_items ?? [],
     };
     job.revisionFingerprint = this.observableState(job);
     return job;
@@ -734,6 +820,7 @@ export class JobManager {
   private async startTurn(job: JobRecord, prompt: string): Promise<void> {
     if (job.threadId === null) throw new Error("no hay thread confirmado para iniciar el turn.");
     this.resetTurn(job);
+    this.persist(job, true);
     const turnPrompt = this.promptForTurn(job, prompt);
     const capture: TurnCapture = { jobId: job.jobId, threadId: job.threadId, turnId: null, buffered: [] };
     this.turnCaptures.set(job.threadId, capture);
@@ -768,6 +855,7 @@ export class JobManager {
   }
 
   private resetTurn(job: JobRecord): void {
+    job.evidenceItems = [];
     job.turnId = null; job.status = "starting"; job.finalMessage = null; job.latestDiff = null;
     job.filesChanged = []; job.commandsExecuted = []; job.error = null; job.pendingApprovals.clear();
     job.lastAgentMessage = null; job.agentMessages.clear(); job.activity = "Starting Codex";
@@ -799,11 +887,11 @@ export class JobManager {
       return;
     }
     const capture = threadId ? this.turnCaptures.get(threadId) : undefined;
-    if (capture && capture.turnId === null && (isTurnScopedMethod(method) || method.includes("requestApproval") || method === "applyPatchApproval" || method === "execCommandApproval")) {
+    if (capture && capture.turnId === null && (isTurnScopedMethod(method) || method.includes("requestApproval") || method === "item/tool/requestUserInput" || method === "applyPatchApproval" || method === "execCommandApproval")) {
       capture.buffered.push(message);
       return;
     }
-    if (method === "item/commandExecution/requestApproval" || method === "item/fileChange/requestApproval" || method === "item/permissions/requestApproval" || method === "applyPatchApproval" || method === "execCommandApproval") {
+    if (method === "item/commandExecution/requestApproval" || method === "item/fileChange/requestApproval" || method === "item/permissions/requestApproval" || method === "item/tool/requestUserInput" || method === "applyPatchApproval" || method === "execCommandApproval") {
       this.handleApprovalRequest(message, method);
       return;
     }
@@ -848,7 +936,7 @@ export class JobManager {
 
   private handleApprovalRequest(
     message: AppServerMessage,
-    method: "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" | "item/permissions/requestApproval" | "applyPatchApproval" | "execCommandApproval",
+    method: "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" | "item/permissions/requestApproval" | "item/tool/requestUserInput" | "applyPatchApproval" | "execCommandApproval",
   ): void {
     if (typeof message.id !== "number" && typeof message.id !== "string") return;
     const params = paramsForMessage(message);
@@ -869,8 +957,8 @@ export class JobManager {
       ? "command_execution"
       : method === "item/fileChange/requestApproval" || method === "applyPatchApproval"
         ? "file_change"
-        : "permissions";
-    job.pendingApprovals.set(idKey(message.id), { requestId: message.id, kind, method, threadId, turnId, itemId, params });
+        : method === "item/tool/requestUserInput" ? "user_input" : "permissions";
+    job.pendingApprovals.set(idKey(message.id), { requestId: message.id, kind, method, threadId, turnId, itemId, params, expiresAt: new Date(Date.now() + 15 * 60_000).toISOString() });
     job.status = "awaiting_approval";
     job.activity = "Waiting for approval";
     this.touch(job);
@@ -899,13 +987,6 @@ export class JobManager {
     }
   }
 
-  private applyStoredTurn(job: JobRecord, turn: JsonObject): void {
-    const turnId = stringValue(turn.id);
-    if (!turnId) return;
-    job.turnId = turnId;
-    this.recordTurnItems(job, turn);
-  }
-
   private applyTerminalStatus(job: JobRecord, status: "completed" | "interrupted" | "failed", turn: JsonObject): void {
     this.recordTurnItems(job, turn);
     if (status === "completed") {
@@ -923,6 +1004,11 @@ export class JobManager {
   }
 
   private recordItem(job: JobRecord, item: JsonObject): void {
+    if (["commandExecution", "fileChange", "agentMessage"].includes(String(item.type)) && typeof item.id === "string") {
+      const index = job.evidenceItems.findIndex(existing => existing.id === item.id);
+      if (index >= 0) job.evidenceItems[index] = structuredClone(item);
+      else job.evidenceItems.push(structuredClone(item));
+    }
     if (item.type === "agentMessage") {
       const id = stringValue(item.id); const text = stringValue(item.text);
       if (!id || text === null) return;
@@ -997,6 +1083,7 @@ export class JobManager {
       turnId: job.turnId,
       status: job.status,
       finalMessage: job.finalMessage,
+      latestDiff: job.latestDiff,
       filesChanged: job.filesChanged,
       error: job.error,
       activity: job.activity,
@@ -1028,6 +1115,7 @@ export class JobManager {
       job_id: job.jobId, thread_id: job.threadId, workspace: job.workspace, turn_id: job.turnId, status: job.status,
       final_message: job.finalMessage, latest_diff: job.latestDiff, files_changed: [...job.filesChanged], commands_executed: [...job.commandsExecuted], error: job.error, updated_at: job.updatedAt,
       revision: job.revision,
+      effective_config: job.effectiveConfig, evidence_items: job.evidenceItems,
       validation: job.validation.map((entry): PersistedValidation => ({
         kind: entry.kind, command: entry.command, status: entry.status,
         ...(entry.exit_code === undefined ? {} : { exit_code: entry.exit_code }),

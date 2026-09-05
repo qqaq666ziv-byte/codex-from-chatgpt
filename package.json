@@ -1,8 +1,8 @@
 {
-  "name": "codex-from-chatgpt",
-  "version": "0.3.1",
+  "name": "autodev",
+  "version": "0.4.0",
   "private": true,
-  "description": "Personal MCP bridge for using local Codex from ChatGPT",
+  "description": "Local Codex execution and versioned review evidence for ordinary ChatGPT Chat",
   "license": "MIT",
   "author": "Antonio Ulloa",
   "type": "module",
@@ -14,10 +14,14 @@
     "start": "node dist/src/index.js",
     "dev": "tsx src/index.ts",
     "test": "tsx --test test/*.test.ts",
-    "typecheck": "tsc --noEmit -p tsconfig.json"
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "check": "npm run typecheck && npm test && npm run build",
+    "test:real": "tsx scripts/real-smoke.ts",
+    "probe": "tsx scripts/probe-app-server.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.30.0",
+    "diff": "8.0.2",
     "zod": "4.4.3"
   },
   "devDependencies": {
@@ -27,10 +31,10 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/joseanu/codex-from-chatgpt.git"
+    "url": "git+https://github.com/qqaq666ziv-byte/codex-from-chatgpt.git"
   },
-  "homepage": "https://github.com/joseanu/codex-from-chatgpt#readme",
+  "homepage": "https://github.com/qqaq666ziv-byte/codex-from-chatgpt/tree/codex/autodev-product#readme",
   "bugs": {
-    "url": "https://github.com/joseanu/codex-from-chatgpt/issues"
+    "url": "https://github.com/qqaq666ziv-byte/codex-from-chatgpt/issues"
   }
 }

@@ -1,11 +1,13 @@
 import { randomUUID } from "node:crypto";
-import { chmodSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync, openSync, closeSync, fsyncSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
 export const STATE_VERSION = 1;
 
 export type PersistedJob = {
+  effective_config?: Record<string, unknown>;
+  evidence_items?: Record<string, unknown>[];
   job_id: string;
   thread_id: string | null;
   workspace: string;
@@ -64,6 +66,8 @@ function validValidation(value: unknown): value is PersistedValidation {
 function validJob(value: unknown): value is PersistedJob {
   if (!isObject(value)) return false;
   return (
+    (value.effective_config === undefined || isObject(value.effective_config)) &&
+    (value.evidence_items === undefined || Array.isArray(value.evidence_items) && value.evidence_items.every(isObject)) &&
     typeof value.job_id === "string" && value.job_id.length > 0 &&
     (value.thread_id === null || typeof value.thread_id === "string" && value.thread_id.length > 0) &&
     typeof value.workspace === "string" && value.workspace.length > 0 &&
@@ -159,7 +163,9 @@ export class StateStore {
     assertUnambiguousJobs(jobs);
     const temporary = path.join(directory, `.${path.basename(this.filePath)}.${process.pid}.${randomUUID()}.tmp`);
     try {
-      writeFileSync(temporary, `${JSON.stringify(payload, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+      const fd = openSync(temporary, "wx", 0o600);
+      try { writeFileSync(fd, `${JSON.stringify(payload, null, 2)}\n`, { encoding: "utf8" }); fsyncSync(fd); }
+      finally { closeSync(fd); }
       renameSync(temporary, this.filePath);
       // chmod is intentional even after replacement: it also repairs an existing
       // state file that had been created with broader permissions.

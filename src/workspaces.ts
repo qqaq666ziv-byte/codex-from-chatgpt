@@ -11,8 +11,20 @@ export class WorkspaceValidationError extends Error {
   }
 }
 
+function hasTraversal(input: string): boolean {
+  // Windows accepts both separators, including a mixture in one path.
+  const separators = process.platform === "win32" ? /[\\/]/ : /\//;
+  return input.split(separators).some((part) => part === "..");
+}
+
+function isFullyQualified(input: string): boolean {
+  if (!path.isAbsolute(input)) return false;
+  // A rooted path such as \work or /work still depends on the current drive.
+  return process.platform !== "win32" || /^[A-Za-z]:[\\/]/.test(input) || /^[\\/]{2}[^\\/]+[\\/][^\\/]+/.test(input);
+}
+
 function configuredRoot(root = process.env.CODEX_WORKSPACE_ROOT ?? DEFAULT_WORKSPACE_ROOT): string {
-  if (!path.isAbsolute(root) || root.includes("\0") || root.split(path.sep).some((part) => part === "..")) {
+  if (typeof root !== "string" || !isFullyQualified(root) || root.includes("\0") || hasTraversal(root)) {
     throw new WorkspaceValidationError("CODEX_WORKSPACE_ROOT debe ser una ruta absoluta sin segmentos '..'.");
   }
   return root;
@@ -26,10 +38,10 @@ export async function validateWorkspace(input: string, rootInput?: string): Prom
   if (input.includes("\0")) {
     throw new WorkspaceValidationError("workspace contiene un byte NUL inválido.");
   }
-  if (!path.isAbsolute(input)) {
+  if (!isFullyQualified(input)) {
     throw new WorkspaceValidationError("workspace debe ser una ruta absoluta.");
   }
-  if (input.split(path.sep).some((part) => part === "..")) {
+  if (hasTraversal(input)) {
     throw new WorkspaceValidationError("workspace no puede contener segmentos '..'.");
   }
 
@@ -37,7 +49,7 @@ export async function validateWorkspace(input: string, rootInput?: string): Prom
   let root: string;
   let candidate: string;
   try {
-    root = await realpath(rootInputValue);
+    root = await realpath(path.resolve(rootInputValue));
     if (!(await stat(root)).isDirectory()) throw new Error("la raíz no es un directorio");
     candidate = await realpath(path.resolve(input));
     if (!(await stat(candidate)).isDirectory()) throw new Error("el workspace no es un directorio");

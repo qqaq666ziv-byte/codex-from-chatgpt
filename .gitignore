@@ -10,3 +10,8 @@ logs/
 protocol/*-json-schema/
 .DS_Store
 *.log
+
+# AutoDev local state and isolated acceptance projects (never publish)
+.runtime/
+.local-tests/
+.tools/

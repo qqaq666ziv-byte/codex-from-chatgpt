@@ -55,6 +55,7 @@ type ExitListener = (error: Error) => void;
 type SpawnFunction = typeof spawn;
 
 const SUPPORTED_SERVER_REQUESTS = new Set([
+  "item/tool/requestUserInput",
   "item/commandExecution/requestApproval",
   "item/fileChange/requestApproval",
   "item/permissions/requestApproval",

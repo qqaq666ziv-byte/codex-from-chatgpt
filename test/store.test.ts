@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, statSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { chmodSync, mkdirSync, mkdtempSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
 import { StateStore } from "../src/store.js";
+
+const testRoot = path.join(process.cwd(), ".local-tests");
+mkdirSync(testRoot, { recursive: true });
 
 function stateJob(jobId: string, threadId: string | null) {
   return {
@@ -22,18 +24,21 @@ function stateJob(jobId: string, threadId: string | null) {
   };
 }
 
-test("state store usa escritura atómica y permisos 0600 incluso si el archivo anterior era amplio", () => {
-  const directory = mkdtempSync(path.join(tmpdir(), "codex-agent-state-"));
+test("state store atomically replaces existing content and restricts POSIX modes where supported", () => {
+  const directory = mkdtempSync(path.join(testRoot, "store-"));
   const file = path.join(directory, "state.json");
   const store = new StateStore(file);
   store.save([stateJob("job-1", "thread-1")]);
   chmodSync(file, 0o644);
-  store.save([stateJob("job-1", "thread-1")]);
-  assert.equal(statSync(file).mode & 0o777, 0o600);
+  store.save([stateJob("replacement-job", "thread-2")]);
+  assert.deepEqual(store.load().map(job => job.job_id), ["replacement-job"]);
+  // Windows access control is checked by the PowerShell behavior suite; Node's
+  // chmod bits do not establish an NTFS confidentiality boundary.
+  if (process.platform !== "win32") assert.equal(statSync(file).mode & 0o777, 0o600);
 });
 
 test("state ambiguo con job_id o thread_id duplicados se rechaza completo", () => {
-  const directory = mkdtempSync(path.join(tmpdir(), "codex-agent-state-"));
+  const directory = mkdtempSync(path.join(testRoot, "store-"));
   const file = path.join(directory, "state.json");
   writeFileSync(file, JSON.stringify({ version: 1, jobs: [stateJob("same", "thread-a"), stateJob("same", "thread-b")] }));
   const store = new StateStore(file);

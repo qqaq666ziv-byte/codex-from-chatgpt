@@ -1,15 +1,26 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import test from "node:test";
+import test, { after } from "node:test";
+import { fileURLToPath } from "node:url";
 
 import type { AppServerMessage, AppServerClient, JsonRpcId } from "../src/codex-app-server.js";
 import { AppServerError, CodexAppServer } from "../src/codex-app-server.js";
 import { COMPLETION_REPORT_MARKER, JobManager } from "../src/jobs.js";
 import { StateStore } from "../src/store.js";
 
-const workspace = process.cwd();
+const productRoot = fileURLToPath(new URL("../", import.meta.url));
+const testRoot = path.join(productRoot, ".local-tests");
+mkdirSync(testRoot, { recursive: true });
+const runtimeRoot = mkdtempSync(path.join(testRoot, "jobs-"));
+const workspace = path.join(runtimeRoot, "workspace");
+mkdirSync(workspace);
+const previousWorkspaceRoot = process.env.CODEX_WORKSPACE_ROOT;
+process.env.CODEX_WORKSPACE_ROOT = runtimeRoot;
+after(() => {
+  if (previousWorkspaceRoot === undefined) delete process.env.CODEX_WORKSPACE_ROOT;
+  else process.env.CODEX_WORKSPACE_ROOT = previousWorkspaceRoot;
+});
 
 class FakeAppServer implements AppServerClient {
   readonly requests: Array<{ method: string; params: unknown }> = [];
@@ -23,6 +34,8 @@ class FakeAppServer implements AppServerClient {
   terminalTurn = false;
   terminalItems: unknown[] = [];
   threadStartError: Error | null = null;
+  threadStartOverrides: Record<string, unknown> = {};
+  requireLoadedThread = false;
   turnStartError: Error | null = null;
   resumeResponse: unknown | null = null;
   resumeGate: Promise<void> | null = null;
@@ -45,15 +58,33 @@ class FakeAppServer implements AppServerClient {
     this.requests.push({ method, params });
     if (method === "thread/start") {
       if (this.threadStartError) throw this.threadStartError;
-      return { thread: { id: "thread-1" } } as T;
+      const requested = params as { model?: string; config?: { model_reasoning_effort?: string }; approvalPolicy?: string; sandbox?: string };
+      return {
+        thread: { id: "thread-1" },
+        model: requested.model ?? "fake-model",
+        reasoningEffort: requested.config?.model_reasoning_effort ?? "medium",
+        approvalPolicy: requested.approvalPolicy,
+        sandbox: requested.sandbox,
+        ...this.threadStartOverrides,
+      } as T;
     }
     if (method === "thread/read") return { thread: this.readThread } as T;
     if (method === "thread/resume") {
       this.resolveResumeStarted();
       if (this.resumeGate) await this.resumeGate;
-      return (this.resumeResponse ?? { thread: this.readThread }) as T;
+      const requested = params as { model?: string; config?: { model_reasoning_effort?: string }; approvalPolicy?: string; sandbox?: string };
+      return (this.resumeResponse ?? {
+        thread: this.readThread,
+        model: requested.model ?? "fake-model",
+        reasoningEffort: requested.config?.model_reasoning_effort ?? "medium",
+        approvalPolicy: requested.approvalPolicy,
+        sandbox: requested.sandbox,
+      }) as T;
     }
     if (method === "turn/start") {
+      if (this.requireLoadedThread && !this.requests.some(request => request.method === "thread/start" || request.method === "thread/resume")) {
+        throw new AppServerError("thread is not loaded; resume it before starting a turn", -32600);
+      }
       if (this.turnStartError) throw this.turnStartError;
       this.turnNumber += 1;
       const turnId = `turn-${this.turnNumber}`;
@@ -76,7 +107,7 @@ class FakeAppServer implements AppServerClient {
 }
 
 function managerFixture(): { fake: FakeAppServer; manager: JobManager; store: StateStore } {
-  const store = new StateStore(path.join(mkdtempSync(path.join(tmpdir(), "codex-agent-mcp-")), "state.json"));
+  const store = new StateStore(path.join(mkdtempSync(path.join(runtimeRoot, "state-")), "state.json"));
   const fake = new FakeAppServer();
   return { fake, manager: new JobManager(fake, { store }), store };
 }
@@ -158,7 +189,7 @@ test("unchanged omite warnings ya conocidos pero conserva la forma mínima", asy
   assert.deepEqual(unchanged, { status: "running", revision: current.revision, unchanged: true });
 });
 
-test("comandos exploratorios y diffs raw no avanzan la revision supervisory", async () => {
+test("exploratory commands keep revision stable while changed evidence diffs advance it", async () => {
   const { fake, manager } = managerFixture();
   const started = await manager.start(workspace, "mantén el polling estable");
   const baseline = manager.get(started.job_id, { detail: "compact" });
@@ -166,17 +197,18 @@ test("comandos exploratorios y diffs raw no avanzan la revision supervisory", as
     fake.emit({ method: "item/started", params: { threadId: "thread-1", turnId: "turn-1", item: { type: "commandExecution", id: `explore-${index}`, command, status: "inProgress" } } });
     fake.emit({ method: "item/completed", params: { threadId: "thread-1", turnId: "turn-1", item: { type: "commandExecution", id: `explore-${index}`, command, status: "completed", exitCode: 0 } } });
   }
+  assert.equal(manager.get(started.job_id).revision, baseline.revision);
   fake.emit({ method: "turn/diff/updated", params: { threadId: "thread-1", turnId: "turn-1", diff: "diff --git a/one b/one" } });
   fake.emit({ method: "turn/diff/updated", params: { threadId: "thread-1", turnId: "turn-1", diff: "diff --git a/two b/two" } });
   const compact = manager.get(started.job_id, { detail: "compact" });
-  assert.equal(compact.revision, baseline.revision);
+  assert.ok(compact.revision > baseline.revision);
   assert.equal(compact.activity, "Codex is working");
   const debug = manager.get(started.job_id, { detail: "debug" });
   assert.deepEqual(debug.commands_executed, ["rg -n TODO .", "sed -n '1,20p' README.md", "cat package.json"]);
   assert.equal(debug.latest_diff, "diff --git a/two b/two");
 });
 
-test("debug con since_revision igual devuelve los diagnosticos actuales", async () => {
+test("debug returns current diagnostic evidence when its revision changes", async () => {
   const { fake, manager } = managerFixture();
   const started = await manager.start(workspace, "diagnostico actual");
   const current = manager.get(started.job_id, { detail: "compact" });
@@ -203,7 +235,7 @@ test("debug con since_revision igual devuelve los diagnosticos actuales", async 
   });
 
   const debug = manager.get(started.job_id, { detail: "debug", since_revision: current.revision });
-  assert.equal(debug.revision, current.revision);
+  assert.ok(debug.revision > current.revision);
   assert.equal(debug.unchanged, undefined);
   assert.deepEqual(debug.commands_executed, ["rg -n TODO ."]);
   assert.equal(debug.latest_diff, "diff --git a/current b/current");
@@ -290,6 +322,30 @@ test("validation extraction is deterministic and excludes exploratory commands",
     { kind: "diff_check", command: "git diff --check", status: "passed", exit_code: 0 },
     { kind: "http_check", command: "curl -fsS http://127.0.0.1:8787/readyz", status: "passed", exit_code: 0 },
   ]);
+});
+
+test("Windows validation commands retain actual exit codes while echoed commands are not tests", async () => {
+  const { fake, manager } = managerFixture();
+  const started = await manager.start(workspace, "verify Windows commands");
+  const cases = [
+    { command: "npm.cmd test", kind: "test", exitCode: 0 },
+    { command: "npm.cmd run typecheck", kind: "typecheck", exitCode: 2 },
+    { command: "node.exe --test test/math.test.js", kind: "test", exitCode: 0 },
+    { command: 'pwsh.exe -NoProfile -Command "node --test test/math.test.js"', kind: "test", exitCode: 1 },
+    { command: '"C:\\Program Files\\PowerShell\\7\\pwsh.exe" -NoProfile -Command "npm.cmd run build"', kind: "build", exitCode: 0 },
+    { command: "echo npm.cmd test", kind: undefined, exitCode: 0 },
+    { command: "Write-Output 'npm.cmd test'", kind: undefined, exitCode: 0 },
+    { command: 'echo pwsh -Command "node --test"', kind: undefined, exitCode: 0 },
+  ];
+  for (const [index, item] of cases.entries()) {
+    fake.emit({ method: "item/completed", params: { threadId: started.thread_id, turnId: started.turn_id, item: {
+      type: "commandExecution", id: `windows-${index}`, command: item.command, status: "completed", exitCode: item.exitCode,
+    } } });
+  }
+  completed(fake);
+  const validation = manager.get(started.job_id).validation ?? [];
+  assert.deepEqual(validation.map(({ command, kind, exit_code, status }) => ({ command, kind, exit_code, status })),
+    cases.filter(item => item.kind).map(item => ({ command: item.command, kind: item.kind, exit_code: item.exitCode, status: item.exitCode === 0 ? "passed" : "failed" })));
 });
 
 test("debug output is bounded without discarding the stored diagnostic state", async () => {
@@ -509,7 +565,7 @@ test("dos recoveries potencialmente activas mantienen un fence global para nuevo
   assert.equal(restarted.get("job-second").status, "recovery_required");
 });
 
-test("turn/start timeout se puede reconciliar en el mismo proceso antes de interrupt", async () => {
+test("turn/start timeout without a confirmed turn identity cannot adopt or interrupt the latest turn", async () => {
   const { fake, manager, store } = managerFixture();
   fake.turnStartError = new AppServerError("timeout de turn", -32002);
   await assert.rejects(manager.start(workspace, "turn incierto"), /job_id=/);
@@ -517,9 +573,114 @@ test("turn/start timeout se puede reconciliar en el mismo proceso antes de inter
   assert.ok(persisted);
   fake.turnStartError = null;
   fake.readThread = { id: "thread-1", turns: [{ id: "turn-1", status: "inProgress", items: [] }] };
-  const interrupted = await manager.interrupt(persisted.job_id);
-  assert.equal(interrupted.status, "interrupting");
-  assert.equal(fake.requests.some((request) => request.method === "thread/resume"), true);
+  await manager.initialize();
+  await assert.rejects(manager.interrupt(persisted.job_id), /no tiene un turn activo/);
+  assert.equal(manager.get(persisted.job_id).status, "recovery_required");
+  assert.equal(manager.evidence(persisted.job_id).turn_id, null);
+  assert.equal(fake.requests.some((request) => request.method === "thread/resume" || request.method === "turn/interrupt"), false);
+});
+
+test("recovery rejects unknown or ambiguous latest turns without importing their evidence", async () => {
+  const foreignItems = [{ type: "agentMessage", id: "foreign-message", text: "must not become our completion", phase: "final_answer" }];
+  const cases = [
+    { savedTurn: null, thread: { id: "thread-1", turns: [{ id: "turn-1", status: "completed", items: foreignItems }] } },
+    { savedTurn: "turn-1", thread: { id: "thread-1", turns: [{ id: "foreign-turn", status: "inProgress", items: foreignItems }] } },
+    { savedTurn: "turn-1", thread: { id: "thread-1", turns: [{ id: "foreign-turn", status: "completed", items: foreignItems }] } },
+    { savedTurn: "turn-1", thread: { id: "thread-1", turns: [] } },
+    { savedTurn: "turn-1", thread: { id: "thread-1", turns: [{ id: "turn-1", status: "completed", items: foreignItems }, null] } },
+    { savedTurn: "turn-1", thread: { id: "thread-1", turns: [{ status: "completed", items: foreignItems }] } },
+    { savedTurn: "turn-1", thread: { id: "thread-1", turns: [{ id: "turn-1", status: "completed" }, { id: "turn-1", status: "completed", items: foreignItems }] } },
+    { savedTurn: "turn-1", thread: { id: "thread-1", turns: [{ id: "turn-1", status: "inProgress" }, { id: "foreign-turn", status: "completed", items: foreignItems }] } },
+    { savedTurn: "turn-1", thread: { id: "foreign-thread", turns: [{ id: "turn-1", status: "completed", items: foreignItems }] } },
+  ];
+  for (const entry of cases) {
+    const { fake, manager, store } = managerFixture();
+    const started = await manager.start(workspace, "retain confirmed identity");
+    fake.emit({ method: "item/completed", params: { threadId: started.thread_id, turnId: started.turn_id, item: { type: "commandExecution", id: "our-command", command: "npm test", status: "completed", exitCode: 0, aggregatedOutput: "our existing evidence" } } });
+    const previousEvidence = manager.evidence(started.job_id);
+    const saved = store.load()[0]!;
+    store.save([{ ...saved, turn_id: entry.savedTurn }]);
+    const recoveredServer = new FakeAppServer();
+    recoveredServer.readThread = entry.thread;
+    const recovered = new JobManager(recoveredServer, { store });
+    await recovered.initialize();
+    const evidence = recovered.evidence(started.job_id);
+    assert.equal(evidence.status, "recovery_required");
+    assert.equal(evidence.turn_id, entry.savedTurn);
+    assert.equal(evidence.thread_id, started.thread_id);
+    assert.equal(evidence.final_message, null);
+    assert.deepEqual(evidence.items, previousEvidence.items);
+    assert.deepEqual(evidence.validation, previousEvidence.validation);
+    assert.equal(store.load()[0]!.turn_id, entry.savedTurn);
+    assert.equal(recoveredServer.requests.some(request => request.method === "thread/resume" || request.method === "turn/start"), false);
+    await assert.rejects(recovered.start(workspace, "do not dispatch across the recovery fence"), /backend bloqueado/);
+  }
+});
+
+test("recovery accepts terminal evidence only for the confirmed saved turn", async () => {
+  const { manager, store } = managerFixture();
+  const started = await manager.start(workspace, "recover our completed turn");
+  const recoveredServer = new FakeAppServer();
+  recoveredServer.readThread = { id: started.thread_id, turns: [{ id: started.turn_id, status: "completed", items: [{ type: "agentMessage", id: "our-final", text: "our completed execution", phase: "final_answer" }] }] };
+  const recovered = new JobManager(recoveredServer, { store });
+  await recovered.initialize();
+  assert.equal(recovered.get(started.job_id).status, "completed");
+  assert.equal(recovered.get(started.job_id).turn_id, started.turn_id);
+  assert.equal(recovered.get(started.job_id).final_message, "our completed execution");
+  assert.equal(recoveredServer.requests.some(request => request.method === "thread/resume"), false);
+});
+
+test("recovery resume cannot adopt a newer turn even when the saved turn remains in history", async () => {
+  for (const status of ["inProgress", "completed"]) {
+    const { manager, store } = managerFixture();
+    const started = await manager.start(workspace, "recover exact active turn");
+    const recoveredServer = new FakeAppServer();
+    recoveredServer.readThread = { id: started.thread_id, turns: [{ id: started.turn_id, status: "inProgress", items: [] }] };
+    recoveredServer.resumeResponse = { thread: { id: started.thread_id, turns: [
+      { id: started.turn_id, status: "inProgress", items: [] },
+      { id: "newer-foreign-turn", status, items: [{ type: "agentMessage", id: "foreign-final", text: "foreign result", phase: "final_answer" }] },
+    ] } };
+    const recovered = new JobManager(recoveredServer, { store });
+    await recovered.initialize();
+    assert.equal(recovered.get(started.job_id).status, "recovery_required");
+    assert.equal(recovered.get(started.job_id).turn_id, started.turn_id);
+    assert.equal(recovered.evidence(started.job_id).final_message, null);
+    assert.deepEqual(recovered.evidence(started.job_id).items, []);
+    assert.equal(recoveredServer.requests.some(request => request.method === "turn/start"), false);
+  }
+});
+
+test("recovery resume confirms configured model and effort before restoring running state", async () => {
+  for (const overrides of [{}, { model: "unexpected-model" }, { reasoningEffort: "low" }, { model: null }, { reasoningEffort: null }]) {
+    const { fake, store } = managerFixture();
+    const manager = new JobManager(fake, { store, model: "selected-model", reasoningEffort: "xhigh" });
+    const started = await manager.start(workspace, "recover with explicit configuration");
+    const recoveredServer = new FakeAppServer();
+    recoveredServer.readThread = { id: started.thread_id, turns: [{ id: started.turn_id, status: "inProgress", items: [] }] };
+    recoveredServer.resumeResponse = { thread: recoveredServer.readThread, model: "selected-model", reasoningEffort: "xhigh", approvalPolicy: "on-request", sandbox: "workspace-write", ...overrides };
+    const recovered = new JobManager(recoveredServer, { store, model: "selected-model", reasoningEffort: "xhigh" });
+    await recovered.initialize();
+    assert.equal(recovered.get(started.job_id).status, Object.keys(overrides).length === 0 ? "running" : "recovery_required");
+    assert.equal(recovered.get(started.job_id).turn_id, started.turn_id);
+    assert.deepEqual(recoveredServer.requests.find(request => request.method === "thread/resume")?.params, {
+      threadId: started.thread_id, cwd: workspace, model: "selected-model", config: { model_reasoning_effort: "xhigh" },
+      approvalPolicy: "on-request", approvalsReviewer: "user", sandbox: "workspace-write",
+    });
+    assert.equal(recoveredServer.requests.some(request => request.method === "turn/start"), false);
+  }
+});
+
+test("the exact saved turn may finish during recovery resume without being replaced", async () => {
+  const { manager, store } = managerFixture();
+  const started = await manager.start(workspace, "finish during resume");
+  const recoveredServer = new FakeAppServer();
+  recoveredServer.readThread = { id: started.thread_id, turns: [{ id: started.turn_id, status: "inProgress", items: [] }] };
+  recoveredServer.resumeResponse = { thread: { id: started.thread_id, turns: [{ id: started.turn_id, status: "completed", items: [{ type: "agentMessage", id: "ours", text: "completed during recovery", phase: "final_answer" }] }] } };
+  const recovered = new JobManager(recoveredServer, { store });
+  await recovered.initialize();
+  assert.equal(recovered.get(started.job_id).status, "completed");
+  assert.equal(recovered.get(started.job_id).turn_id, started.turn_id);
+  assert.equal(recovered.get(started.job_id).final_message, "completed during recovery");
 });
 
 test("state durable permite restart y rehidrata sin inventar completion", async () => {
@@ -587,7 +748,7 @@ test("codex_get ve el índice persistido antes de initialize", async () => {
 });
 
 test("state antiguo sin revision se rehidrata con revision 0", () => {
-  const directory = mkdtempSync(path.join(tmpdir(), "codex-agent-mcp-"));
+  const directory = mkdtempSync(path.join(runtimeRoot, "state-"));
   const file = path.join(directory, "state.json");
   writeFileSync(file, JSON.stringify({ version: 1, jobs: [{
     job_id: "legacy-job", thread_id: "legacy-thread", workspace, turn_id: null, status: "completed",
@@ -600,7 +761,7 @@ test("state antiguo sin revision se rehidrata con revision 0", () => {
 });
 
 test("thread/start timeout queda journalizado y activa el fence sin adopción heurística", async () => {
-  const store = new StateStore(path.join(mkdtempSync(path.join(tmpdir(), "codex-agent-mcp-")), "state.json"));
+  const store = new StateStore(path.join(mkdtempSync(path.join(runtimeRoot, "state-")), "state.json"));
   const fake = new FakeAppServer();
   fake.threadStartError = Object.assign(new Error("timeout"), { code: -32002 });
   const manager = new JobManager(fake, { store });
@@ -633,7 +794,7 @@ test("thread/start rechazo explícito falla el job y no deja fence", async () =>
 });
 
 test("thread/start incierto no adopta un thread por preview o timestamp", async () => {
-  const store = new StateStore(path.join(mkdtempSync(path.join(tmpdir(), "codex-agent-mcp-")), "state.json"));
+  const store = new StateStore(path.join(mkdtempSync(path.join(runtimeRoot, "state-")), "state.json"));
   const fake = new FakeAppServer();
   fake.threadStartError = new AppServerError("timeout", -32002);
   const manager = new JobManager(fake, { store });
@@ -644,16 +805,17 @@ test("thread/start incierto no adopta un thread por preview o timestamp", async 
 
 test("fallo de persistencia en listener se diagnostica sin tumbar el proceso", async () => {
   class FailingStore extends StateStore {
-    private saves = 0;
+    failSaves = false;
     override save(jobs: Parameters<StateStore["save"]>[0]): void {
-      if (this.saves++ > 2) throw new Error("disco no disponible");
+      if (this.failSaves) throw new Error("disco no disponible");
       super.save(jobs);
     }
   }
-  const store = new FailingStore(path.join(mkdtempSync(path.join(tmpdir(), "codex-agent-mcp-")), "state.json"));
+  const store = new FailingStore(path.join(mkdtempSync(path.join(runtimeRoot, "state-")), "state.json"));
   const fake = new FakeAppServer();
   const manager = new JobManager(fake, { store });
   const started = await manager.start(workspace, "persistencia");
+  store.failSaves = true;
   assert.doesNotThrow(() => fake.emit({ method: "item/completed", params: { threadId: "thread-1", turnId: "turn-1", item: { type: "commandExecution", command: "pwd", status: "completed" } } }));
   assert.equal(manager.get(started.job_id).status, "recovery_required");
 });
@@ -664,7 +826,7 @@ test("fallo de persistencia inicial activa el fence de recovery", async () => {
       throw new Error("disco no disponible");
     }
   }
-  const store = new InitialFailingStore(path.join(mkdtempSync(path.join(tmpdir(), "codex-agent-mcp-")), "state.json"));
+  const store = new InitialFailingStore(path.join(mkdtempSync(path.join(runtimeRoot, "state-")), "state.json"));
   const manager = new JobManager(new FakeAppServer(), { store });
   let failure: Error | undefined;
   try {
@@ -681,7 +843,7 @@ test("fallo de persistencia inicial activa el fence de recovery", async () => {
 });
 
 test("store corrupto no tumba el servicio y conserva diagnóstico", () => {
-  const directory = mkdtempSync(path.join(tmpdir(), "codex-agent-state-"));
+  const directory = mkdtempSync(path.join(runtimeRoot, "state-"));
   const file = path.join(directory, "state.json");
   writeFileSync(file, "not json\n");
   const store = new StateStore(file);
@@ -690,7 +852,7 @@ test("store corrupto no tumba el servicio y conserva diagnóstico", () => {
 });
 
 test("app-server real fake fixture: timeout, JSONL fatal, unknown request error y recuperación", async () => {
-  const commandArgs = [path.join(process.cwd(), "test/fixtures/fake-app-server.mjs")];
+  const commandArgs = [path.join(productRoot, "test/fixtures/fake-app-server.mjs")];
   const client = new CodexAppServer({ command: process.execPath, commandArgs, rpcTimeoutMs: 500, shutdownTimeoutMs: 80, killTimeoutMs: 80 });
   await client.start();
   const unknown = await client.request<{ code: number }>("triggerUnknown");
@@ -703,4 +865,163 @@ test("app-server real fake fixture: timeout, JSONL fatal, unknown request error 
   await client.start();
   assert.equal(client.isReady(), true);
   await client.stop();
+});
+
+test("evidence retains full immutable items and diff plus effective configuration across restart", async () => {
+  const { fake, store } = managerFixture();
+  const manager = new JobManager(fake, { store, model: "fake-specific", reasoningEffort: "xhigh" });
+  const started = await manager.start(workspace, "collect full evidence");
+  const output = "output 繁體😀\n".repeat(6_000);
+  const diff = "diff --git a/a.txt b/a.txt\n" + "+繁體😀\n".repeat(6_000);
+  const item = { type: "commandExecution", id: "full-output", command: "npm test", status: "completed", exitCode: 0, cwd: workspace, aggregatedOutput: output };
+  fake.emit({ method: "item/completed", params: { threadId: started.thread_id, turnId: started.turn_id, item } });
+  fake.emit({ method: "turn/diff/updated", params: { threadId: started.thread_id, turnId: started.turn_id, diff } });
+  completed(fake, started.turn_id, started.thread_id);
+  const evidence = manager.evidence(started.job_id);
+  assert.equal(evidence.latest_diff, diff);
+  assert.equal(evidence.items.find(value => value.id === item.id)?.aggregatedOutput, output);
+  assert.equal(evidence.effective_config.model, "fake-specific");
+  assert.equal(evidence.effective_config.reasoningEffort, "xhigh");
+  assert.equal(evidence.effective_config.approvalPolicy, "on-request");
+  assert.equal(evidence.effective_config.sandbox, "workspace-write");
+  const restarted = new JobManager(new FakeAppServer(), { store });
+  assert.deepEqual(restarted.evidence(started.job_id), evidence);
+  evidence.items[0]!.aggregatedOutput = "modified caller view";
+  evidence.effective_config.model = "modified caller view";
+  assert.equal(manager.evidence(started.job_id).items[0]?.aggregatedOutput, output);
+  assert.equal(manager.evidence(started.job_id).effective_config.model, "fake-specific");
+});
+
+test("requested model mismatch records failure without starting an execution turn", async () => {
+  const { fake, store } = managerFixture();
+  fake.threadStartOverrides = { model: "unexpected-model" };
+  const manager = new JobManager(fake, { store, model: "requested-model", reasoningEffort: "xhigh" });
+  await assert.rejects(manager.start(workspace, "must not silently fallback"), /Effective model\/effort/);
+  assert.equal(fake.requests.some(request => request.method === "turn/start"), false);
+  assert.equal(manager.list().length, 1);
+  assert.equal(manager.list()[0]?.status, "failed");
+});
+
+test("injected workspace allowlist rejects execution before any app-server request", async () => {
+  const { fake, store } = managerFixture();
+  const manager = new JobManager(fake, { store, workspaceValidator: async () => { throw new Error("not registered"); } });
+  await assert.rejects(manager.start(workspace, "invalid project"), /not registered/);
+  assert.equal(fake.requests.length, 0);
+  assert.deepEqual(manager.list(), []);
+});
+
+test("requested job identity survives restart and cannot dispatch a second execution", async () => {
+  const { fake, manager, store } = managerFixture();
+  const started = await manager.start(workspace, "one durable request", "durable-request-id");
+  assert.equal(started.job_id, "durable-request-id");
+  completed(fake);
+  const original = manager.evidence(started.job_id);
+  const restartedServer = new FakeAppServer();
+  const restarted = new JobManager(restartedServer, { store });
+  await assert.rejects(restarted.start(workspace, "duplicate submission", "durable-request-id"), /identity already exists/);
+  assert.equal(restartedServer.requests.length, 0);
+  assert.deepEqual(restarted.evidence(started.job_id), original);
+  assert.deepEqual(restarted.list().map(job => job.job_id), ["durable-request-id"]);
+});
+
+test("requested reasoning effort mismatch also prevents execution", async () => {
+  const { fake, store } = managerFixture();
+  fake.threadStartOverrides = { reasoningEffort: "low" };
+  const manager = new JobManager(fake, { store, model: "requested-model", reasoningEffort: "xhigh" });
+  await assert.rejects(manager.start(workspace, "require selected effort"), /Effective model\/effort/);
+  assert.equal(fake.requests.some(request => request.method === "turn/start"), false);
+  assert.equal(manager.evidence(manager.list()[0]!.job_id!).effective_config.reasoningEffort, "low");
+});
+
+function productQuestion(fake: FakeAppServer, requestId: JsonRpcId, turnId = "turn-1", threadId = "thread-1"): void {
+  fake.emit({ id: requestId, method: "item/tool/requestUserInput", params: {
+    threadId, turnId, itemId: "question-item",
+    questions: [{ id: "color", header: "Color", question: "Choose a color", options: [{ label: "blue", description: "Blue theme" }] }],
+  } });
+}
+
+test("product questions require exact request and answer IDs and reject replay", async () => {
+  const { fake, manager } = managerFixture();
+  const started = await manager.start(workspace, "ask the user");
+  productQuestion(fake, 42);
+  const pending = manager.get(started.job_id).pending_approvals?.[0];
+  assert.equal(pending?.kind, "user_input");
+  assert.deepEqual(pending?.questions, [{ id: "color", header: "Color", question: "Choose a color", options: [{ label: "blue", description: "Blue theme" }] }]);
+  assert.ok(pending?.expires_at);
+  await assert.rejects(manager.respondUserInput(started.job_id, "42", { color: { answers: ["blue"] } }), /Unknown, stale/);
+  await assert.rejects(manager.respondUserInput(started.job_id, 42, { wrong: { answers: ["blue"] } }), /exactly match/);
+  await assert.rejects(manager.respondUserInput(started.job_id, 42, { color: { answers: [] } }), /exactly match/);
+  await assert.rejects(manager.respondApproval(started.job_id, 42, "accept"), /respondUserInput/);
+  assert.equal(fake.responses.length, 0);
+  const answer = { color: { answers: ["blue"] } };
+  const result = await manager.respondUserInput(started.job_id, 42, answer);
+  assert.equal(result.status, "running");
+  assert.deepEqual(fake.responses, [{ id: 42, result: { answers: answer } }]);
+  await assert.rejects(manager.respondUserInput(started.job_id, 42, answer), /Unknown, stale/);
+  assert.equal(fake.responses.length, 1);
+});
+
+test("expired product question does not send an answer or infer approval", async (context) => {
+  const { fake, manager } = managerFixture();
+  const started = await manager.start(workspace, "wait for answer");
+  const beforeQuestion = Date.now();
+  productQuestion(fake, "expiry");
+  const expiresAt = manager.get(started.job_id).pending_approvals?.[0]?.expires_at;
+  assert.ok(expiresAt);
+  assert.ok(Date.parse(expiresAt) >= beforeQuestion + 15 * 60 * 1_000);
+  assert.ok(Date.parse(expiresAt) <= Date.now() + 15 * 60 * 1_000);
+  context.mock.method(Date, "now", () => Date.parse(expiresAt));
+  await assert.rejects(manager.respondUserInput(started.job_id, "expiry", { color: { answers: ["blue"] } }), /expired/);
+  assert.equal(fake.responses.length, 0);
+  assert.equal(manager.get(started.job_id).status, "awaiting_approval");
+});
+
+test("product question cannot be answered through another job or a completed turn", async () => {
+  const { fake, manager } = managerFixture();
+  const first = await manager.start(workspace, "first job");
+  productQuestion(fake, "old");
+  completed(fake);
+  await assert.rejects(manager.respondUserInput(first.job_id, "old", { color: { answers: ["blue"] } }), /Unknown, stale/);
+  fake.threadStartOverrides = { thread: { id: "thread-2" } };
+  const second = await manager.start(workspace, "second job");
+  productQuestion(fake, "current", second.turn_id, second.thread_id);
+  await assert.rejects(manager.respondUserInput(first.job_id, "current", { color: { answers: ["blue"] } }), /Unknown, stale/);
+  assert.equal(manager.get(second.job_id).pending_approvals?.[0]?.request_id, "current");
+  assert.equal(manager.list().length, 2);
+  assert.equal(fake.responses.length, 0);
+});
+
+test("continuing a terminal persisted job loads its thread into the new app-server first", async () => {
+  const { fake, store } = managerFixture();
+  const manager = new JobManager(fake, { store, model: "selected-model", reasoningEffort: "xhigh" });
+  const started = await manager.start(workspace, "first execution");
+  completed(fake);
+  const freshServer = new FakeAppServer();
+  freshServer.requireLoadedThread = true;
+  freshServer.readThread = { id: started.thread_id, turns: [{ id: started.turn_id, status: "completed", items: [] }] };
+  const restarted = new JobManager(freshServer, { store, model: "selected-model", reasoningEffort: "xhigh" });
+  const next = await restarted.continue(started.job_id, "review requested repair");
+  assert.equal(next.thread_id, started.thread_id);
+  const methods = freshServer.requests.map(request => request.method);
+  assert.ok(methods.indexOf("thread/resume") >= 0);
+  assert.ok(methods.indexOf("thread/resume") < methods.indexOf("turn/start"));
+  assert.equal(restarted.evidence(started.job_id).effective_config.model, "selected-model");
+  assert.equal(restarted.evidence(started.job_id).effective_config.reasoningEffort, "xhigh");
+});
+
+test("continue refuses resumed model or effort drift before dispatching a new turn", async () => {
+  for (const overrides of [{ model: "different-model" }, { reasoningEffort: "low" }, { model: undefined }, { reasoningEffort: undefined }]) {
+    const { fake, store } = managerFixture();
+    const manager = new JobManager(fake, { store, model: "selected-model", reasoningEffort: "xhigh" });
+    const started = await manager.start(workspace, "initial execution");
+    completed(fake);
+    fake.resumeResponse = {
+      thread: { id: started.thread_id, turns: [{ id: started.turn_id, status: "completed", items: [] }] },
+      model: "selected-model", reasoningEffort: "xhigh", ...overrides,
+    };
+    const priorTurns = fake.requests.filter(request => request.method === "turn/start").length;
+    await assert.rejects(manager.continue(started.job_id, "follow-up execution"), /Resumed model\/effort/);
+    assert.equal(fake.requests.filter(request => request.method === "turn/start").length, priorTurns);
+    assert.equal(manager.get(started.job_id).status, "recovery_required");
+  }
 });

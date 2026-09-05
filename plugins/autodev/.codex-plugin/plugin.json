@@ -1,0 +1,19 @@
+{
+  "name": "autodev",
+  "version": "0.1.0",
+  "description": "Coordinate authorized AutoDev jobs and evidence-based reviews through the separately connected AutoDev MCP service.",
+  "author": {
+    "name": "AutoDev contributors"
+  },
+  "skills": "./skills/",
+  "license": "MIT",
+  "interface": {
+    "displayName": "AutoDev",
+    "shortDescription": "Plan local development and review complete evidence.",
+    "longDescription": "A portable planner and reviewer workflow for AutoDev. The authenticated AutoDev MCP connection must be added separately; installing this skill does not connect ChatGPT or grant workspace permissions.",
+    "developerName": "AutoDev contributors",
+    "category": "Productivity",
+    "capabilities": [],
+    "defaultPrompt": ["List my AutoDev projects and current jobs.", "Review the complete evidence for my latest AutoDev job."]
+  }
+}
