@@ -1,6 +1,6 @@
 # 架構與恢復規則
 
-ChatGPT 的 MCP 工具經官方 Tunnel、stdio proxy、經認證的 loopback HTTP 服務進入 AutoDev；AutoDev 使用官方 Codex App Server 的 thread/turn 執行介面。沒有另外計費的 API 規劃者，也沒有自製聊天介面。
+一般 ChatGPT 的 MCP 工具經 Quick Tunnel HTTPS、本機 OAuth gateway 與經認證的 loopback HTTP 服務進入 AutoDev；本機 MCP 客戶端也可使用 stdio proxy。AutoDev 使用官方 Codex App Server 的 thread/turn 執行介面。沒有另外計費的 API 規劃者，也沒有自製聊天介面。
 
 ## 儲存與身分
 
@@ -8,7 +8,15 @@ ChatGPT 的 MCP 工具經官方 Tunnel、stdio proxy、經認證的 loopback HTT
 
 同一 request key 只代表一個邏輯操作；成功重試回傳原結果，不另執行。若重啟時操作仍 pending，就標成 uncertain，不猜測副作用是否發生。持久產品 job ID、executor thread/turn 及要求版本保留，用來查明原結果。網路逾時不能換新 key 再試。
 
-證據封存綁定 job、thread、turn、revision、完整 execution hash 與 source hash。ChatGPT 逐頁讀取的收據屬於該 MCP session；尚未提交審查時換 session，需要重讀。已成功持久化的 review 可用相同 request key/body 在重連後取得相同結果。
+證據封存綁定 job、thread、turn、revision、完整 execution hash 與 source hash。直接連入本機的 MCP 客戶端使用有狀態 session，逐頁讀取收據屬於該 session；關閉、過期或更換 session 後，尚未提交的審查需要重讀。
+
+受信任 gateway 使用每請求獨立的無狀態 HTTP MCP transport，讀取收據則歸屬於 **issuer 與 OAuth grant 組成的穩定審查身分**。同一 grant 的 token 輪替或不同 HTTP 請求不會拆散收據。gateway 以本機 admin token 衍生的 HMAC 金鑰簽署 assertion，綁定 issuer、grant、POST 方法、`/mcp` 路徑、原始 request body 雜湊、最長 60 秒有效期與單次 nonce。核心驗證簽章及重播紀錄後才接受該身分；公開請求提供的 assertion／簽章不會被 gateway 轉送，只有一般 client token 或 OAuth token 無法偽造此證明。
+
+同一外掛連線可能讓多個一般 ChatGPT 對話共用 OAuth grant。伺服器強制檢查的是**已驗證 grant 對指定 manifest 的完整逐頁讀取**，無法用密碼學證明是某一個對話或模型親自完成審查。要確認「同一聊天完成讀取與審查」，仍須另外核對該聊天的 UI 與實際工具呼叫證據。
+
+gateway 審查身分閒置 30 分鐘後清除讀取收據；核心服務重啟也清除全部記憶體收據。不同 grant、收據過期或核心重啟後，必須重新逐頁讀完同一 manifest 的所有 artifact。已成功持久化的 review 仍可用相同 request key/body 在重連後取得原結果。
+
+review 在異動鎖內先驗證 manifest、完整讀取、來源與 execution／測試證據，再建立 journal pending。此階段的拒絕不新增 request 紀錄，可修正前提後重試同 key；缺少收據會回 `EVIDENCE_NOT_READ`。若 dispatch 前的再次驗證發現身分已失效等變化，會記為已確認無寫入的 failed；真正的持久化失敗仍保留 uncertain。既有 uncertain key 不會因程式更新而自動清除或重播，仍須查明原結果。
 
 ## 核准與問題
 

@@ -1,13 +1,11 @@
-import { randomUUID } from 'node:crypto';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import path from 'node:path';
 import { realpathSync } from 'node:fs';
-import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import { CodexAppServer } from './codex-app-server.js';
 import { JobManager } from './jobs.js';
 import { StateStore } from './store.js';
-import { createMcpServer, approvalSchema, answerSchema } from './mcp.js';
+import { approvalSchema, answerSchema } from './mcp.js';
+import { createMcpHttpHandler } from './mcp-http.js';
 import { AutoDev } from './product.js';
 import { loadLocalConfig, readLocalToken, authorized } from './local-config.js';
 import { acquireRuntimeLock } from './runtime-lock.js';
@@ -26,9 +24,9 @@ async function main() {
     if(!config.projects.some(p=>p.path===canonical))throw new Error('Workspace is not in the administrative project registry.');return canonical;
   }});
   const product=new AutoDev(config,jobs);
-  const sessions=new Map<string,{transport:StreamableHTTPServerTransport;tag:string}>();
   let ready=false;let bootFailure=false;let closing=false;
   const hosts=[`127.0.0.1:${config.port}`,`localhost:${config.port}`];
+  const mcpHttp=createMcpHttpHandler({product,hosts,adminToken});
   const server=createServer(async(req,res)=>{
     try {
       if(!hosts.includes(req.headers.host??'')||req.headers.origin){json(res,403,{error:'Host or Origin rejected.'});return;}
@@ -46,28 +44,13 @@ async function main() {
       }
       if(url.pathname!=='/mcp'){json(res,404,{error:'Not found.'});return;}
       if(!ready||!appServer.isReady()){json(res,503,{error:'Executor unavailable; inspect local status and restart to reconcile.'});return;}
-      const id=typeof req.headers['mcp-session-id']==='string'?req.headers['mcp-session-id']:undefined;
-      let session=id?sessions.get(id):undefined;
-      if(req.method==='POST'){
-        const parsed=await body(req);
-        if(!session&&!id&&isInitializeRequest(parsed)){
-          if(sessions.size>=32){json(res,429,{error:'Session capacity reached.'});return;}
-          const tag=randomUUID();let transport:StreamableHTTPServerTransport;
-          transport=new StreamableHTTPServerTransport({sessionIdGenerator:()=>randomUUID(),enableJsonResponse:true,enableDnsRebindingProtection:true,allowedHosts:hosts,onsessioninitialized:newId=>{sessions.set(newId,{transport,tag});}});
-          transport.onclose=()=>{if(transport.sessionId)sessions.delete(transport.sessionId);product.forgetSession(tag);};
-          await createMcpServer(product,tag).connect(transport);session={transport,tag};
-        }
-        if(!session){json(res,404,{error:'Unknown MCP session; reconnect and use autodev_status to recover.'});return;}
-        await session.transport.handleRequest(req,res,parsed);return;
-      }
-      if((req.method==='GET'||req.method==='DELETE')&&session){await session.transport.handleRequest(req,res);return;}
-      json(res,405,{error:'Unsupported method or missing session.'});
+      await mcpHttp.handle(req,res);
     }catch{json(res,400,{error:'Operation rejected. Inspect the exact request and local admin status.'});}
   });
   server.requestTimeout=30_000;server.headersTimeout=10_000;
   async function shutdown(){
     if(closing)return;closing=true;ready=false;
-    for(const session of sessions.values()){await session.transport.close().catch(()=>{});}
+    await mcpHttp.close();
     await appServer.stop();server.closeAllConnections();
     await new Promise<void>(resolve=>server.close(()=>resolve()));release();
   }

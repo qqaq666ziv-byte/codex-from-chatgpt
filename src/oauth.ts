@@ -45,6 +45,13 @@ function validRedirect(value: unknown): value is string {
   } catch { return false; }
 }
 
+function validUiLocales(value: string): boolean {
+  if (value.length === 0 || value.length > 256) return false;
+  const locales = value.split(" ");
+  if (locales.length > 8 || locales.some((locale) => !/^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*$/.test(locale))) return false;
+  try { Intl.getCanonicalLocales(locales); return true; } catch { return false; }
+}
+
 function shortCode(): string {
   const alphabet = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
   // Rejection sampling avoids bias even if the readable alphabet changes.
@@ -127,7 +134,10 @@ export class OAuthGate {
 
   begin(params: URLSearchParams): OAuthPendingRequest {
     const now = this.prepare("begin", 128);
-    const form = this.form(params, ["response_type", "client_id", "redirect_uri", "state", "resource", "scope", "code_challenge", "code_challenge_method"]);
+    const form = this.form(params, ["response_type", "client_id", "redirect_uri", "state", "resource", "scope", "code_challenge", "code_challenge_method"], ["ui_locales"]);
+    // ChatGPT sends this optional display preference. It never changes consent,
+    // identity, scope, token bindings, or the gateway's configured UI language.
+    if (form.ui_locales !== undefined && !validUiLocales(form.ui_locales)) failure("invalid_request", "UI locales must be a bounded list of language tags");
     if (form.response_type !== "code") failure("invalid_request", "Only response_type code is supported");
     const client = this.client(form.client_id!);
     if (!validRedirect(form.redirect_uri) || !client.redirects.includes(form.redirect_uri)) failure("invalid_redirect_uri", "Redirect URI was not registered for this client");

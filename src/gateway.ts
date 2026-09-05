@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { OAuthGate, OAuthError } from './oauth.js';
 import { authorized } from './local-config.js';
+import { gatewayAssertion } from './gateway-identity.js';
 
 type Options={issuer:string;publicPort:number;controlPort:number;upstream:string;clientToken:string;adminToken:string;instance?:string;onShutdown?:()=>void};
 const escape=(s:string)=>s.replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]!));
@@ -14,7 +15,7 @@ export async function createGateway(options:Options) {
   const upstream=new URL(options.upstream);
   if(upstream.protocol!=='http:'||upstream.hostname!=='127.0.0.1'||upstream.pathname!=='/mcp')throw new Error('Upstream must be the local AutoDev MCP endpoint.');
   const gate=new OAuthGate({issuer:options.issuer});
-  const sessions=new Map<string,string>();
+  let activeRequests=0;
   const publicServer=createServer(async(req,res)=>{
     try {
       if(req.headers.host!==issuer.host&&req.headers.host!==`127.0.0.1:${options.publicPort}`){json(res,403,{error:'invalid_host'});return;}
@@ -38,23 +39,28 @@ export async function createGateway(options:Options) {
       }
       if(url.pathname!=='/mcp'||url.search){json(res,404,{error:'not_found'});return;}
       if(req.method==='GET'){json(res,405,{error:'SSE is unavailable; use JSON POST.'});return;}
-      if(req.method!=='POST'&&req.method!=='DELETE'){json(res,405,{error:'method_not_allowed'});return;}
+      if(req.method!=='POST'){json(res,405,{error:'method_not_allowed'});return;}
       const header=req.headers.authorization;
       if(!header?.startsWith('Bearer ')){res.setHeader('WWW-Authenticate',`Bearer resource_metadata="${options.issuer}/.well-known/oauth-protected-resource/mcp"`);json(res,401,{error:'invalid_token'});return;}
       let grant;
       try{grant=gate.verify(header.slice(7));}catch{res.setHeader('WWW-Authenticate',`Bearer resource_metadata="${options.issuer}/.well-known/oauth-protected-resource/mcp"`);json(res,401,{error:'invalid_token'});return;}
       const sid=req.headers['mcp-session-id'];
-      if(sid&&(typeof sid!=='string'||sessions.get(sid)!==grant.grant_id)){json(res,404,{error:'unknown_session'});return;}
-      if(!sid&&sessions.size>=32){json(res,429,{error:'session_capacity'});return;}
-      const headers:Record<string,string>={Authorization:`Bearer ${options.clientToken}`,Accept:'application/json, text/event-stream','Content-Type':'application/json'};
-      if(typeof sid==='string')headers['mcp-session-id']=sid;
-      if(typeof req.headers['mcp-protocol-version']==='string')headers['mcp-protocol-version']=req.headers['mcp-protocol-version'];
-      const response=await fetch(upstream,{method:req.method,headers,...(req.method==='POST'?{body:await body(req)}:{}),signal:AbortSignal.timeout(60_000),redirect:'error'});
-      const responseId=response.headers.get('mcp-session-id');
-      if(responseId){const owner=sessions.get(responseId);if(owner&&owner!==grant.grant_id)throw new Error('Session ownership changed.');sessions.set(responseId,grant.grant_id);res.setHeader('mcp-session-id',responseId);}
-      if(req.method==='DELETE'&&response.ok&&typeof sid==='string')sessions.delete(sid);
-      if((response.headers.get('content-type')??'').includes('text/event-stream'))throw new Error('SSE response is unsupported.');
-      res.writeHead(response.status,{'Content-Type':response.headers.get('content-type')??'application/json','Cache-Control':'no-store'});res.end(await response.text());
+      if(sid){json(res,404,{error:'stateless_mcp_reconnect_without_session_id'});return;}
+      if(activeRequests>=64){json(res,429,{error:'concurrent_request_capacity'});return;}
+      activeRequests++;
+      try {
+        const content=await body(req);
+        // Build an allowlist from scratch: no public assertion, credential,
+        // cookie or session header is trusted or forwarded from the client.
+        const headers:Record<string,string>={Authorization:`Bearer ${options.clientToken}`,Accept:'application/json, text/event-stream','Content-Type':'application/json',
+          ...gatewayAssertion(options.adminToken,{issuer:options.issuer,grantId:grant.grant_id,expiresAt:grant.expires_at,body:content})};
+        if(typeof req.headers['mcp-protocol-version']==='string')headers['mcp-protocol-version']=req.headers['mcp-protocol-version'];
+        const response=await fetch(upstream,{method:'POST',headers,body:content,signal:AbortSignal.timeout(60_000),redirect:'error'});
+        if(response.headers.get('mcp-session-id')||(response.headers.get('content-type')??'').includes('text/event-stream')) {
+          await response.body?.cancel();throw new Error('The trusted gateway requires stateless JSON MCP responses.');
+        }
+        res.writeHead(response.status,{'Content-Type':response.headers.get('content-type')??'application/json','Cache-Control':'no-store'});res.end(await response.text());
+      } finally { activeRequests--; }
     }catch(error){if(!res.headersSent)json(res,error instanceof OAuthError?error.status:400,{error:error instanceof OAuthError?error.code:'request_rejected'});else res.end();}
   });
   const controlServer=createServer(async(req,res)=>{

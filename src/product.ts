@@ -5,7 +5,7 @@ import { z } from 'zod';
 import { JobManager } from './jobs.js';
 import type { JsonRpcId } from './codex-app-server.js';
 import { EvidenceStore, redactSensitiveText } from './evidence.js';
-import { IdempotencyJournal } from './journal.js';
+import { IdempotencyJournal, JournalDefinitiveError } from './journal.js';
 import type { LocalConfig } from './local-config.js';
 import { snapshotSource, sourceDiff, type SourceSnapshot } from './snapshot.js';
 import { redactValue } from './redaction.js';
@@ -18,6 +18,14 @@ const stateSchema=z.object({version:z.literal(1),records:z.array(z.object({jobId
 type ProductState=z.infer<typeof stateSchema>;
 type Round=z.infer<typeof roundSchema>;
 export type TaskInput={request_key:string;project_id:string;requirements:string;acceptance:string[]};
+type ReviewInput={request_key:string;job_id:string;manifest_id:string;verdict:'pass'|'changes_requested';summary:string};
+export class ReviewPreconditionError extends Error {
+  readonly code='EVIDENCE_NOT_READ';
+  constructor(readonly unread_artifacts:string[]) {
+    super('EVIDENCE_NOT_READ: Read all artifact pages in this authenticated review connection before recording review. No review was written; retry the same request after reading.');
+    this.name='ReviewPreconditionError';
+  }
+}
 const active=new Set(['starting','running','awaiting_approval','interrupting','recovery_required']);
 const safe=<T>(value:T):T=>JSON.parse(JSON.stringify(redactValue(value))) as T;
 const fingerprint=(source:SourceSnapshot)=>hash(JSON.stringify({head:source.head,files:Object.entries(source.files).map(([name,f])=>[name,f.sha256]),omitted:source.omitted}));
@@ -29,12 +37,15 @@ export class AutoDev {
   readonly journal:IdempotencyJournal;
   private receipts=new Map<string,number>();
   private mutation:Promise<void>=Promise.resolve();
-  private execute<T>(key:string,payload:unknown,operation:()=>Promise<T>):Promise<T> {
-    return this.journal.execute(key,payload,async()=>{
-      const previous=this.mutation;let release!:()=>void;
-      this.mutation=new Promise<void>(resolve=>{release=resolve;});await previous;
-      try{return await operation();}finally{release();}
-    });
+  private async execute<T>(key:string,payload:unknown,operation:()=>Promise<T>,preflight?:()=>void):Promise<T> {
+    const previous=this.mutation;let release!:()=>void;
+    this.mutation=new Promise<void>(resolve=>{release=resolve;});await previous;
+    try {
+      // Existing keys must retain the journal's replay/conflict/recovery rules,
+      // including successful review replay after the reader session has closed.
+      if(preflight&&!this.journal.list().some(record=>record.key===key))preflight();
+      return await this.journal.execute(key,payload,operation);
+    } finally {release();}
   }
   constructor(readonly config:LocalConfig,readonly jobs:JobManager) {
     this.file=path.join(config.runtimeDir,'product-state.json');
@@ -138,12 +149,15 @@ export class AutoDev {
     return page;
   }
   forgetSession(session:string) {for(const key of this.receipts.keys())if(key.startsWith(`${session}:`))this.receipts.delete(key);}
-  async review(session:string,input:{request_key:string;job_id:string;manifest_id:string;verdict:'pass'|'changes_requested';summary:string}) {
-    return this.execute(input.request_key,{operation:'review',...input},async()=>{
-      const round=this.current(input.job_id);const manifest=this.seal(input.job_id);
+  private reviewPreflight(session:string,input:ReviewInput) {
+      const round=this.current(input.job_id);
+      if(!round.manifestId)throw new Error('Seal the current evidence manifest and read all artifacts before recording review.');
+      const manifest=this.seal(input.job_id);
       if(round.manifestId!==input.manifest_id||manifest.id!==input.manifest_id)throw new Error('Stale evidence revision.');
+      if(input.verdict!=='pass'&&input.verdict!=='changes_requested')throw new Error('Provide a supported review verdict.');
       if(!input.summary.trim()||input.summary.length>24000)throw new Error('Provide a bounded, substantive review summary.');
-      for(const artifact of manifest.artifacts)if((this.receipts.get(`${session}:${manifest.id}:${artifact.name}`)??-1)<artifact.byteLength)throw new Error('Read all artifact pages in this MCP session before recording review.');
+      const unread=manifest.artifacts.filter(artifact=>(this.receipts.get(`${session}:${manifest.id}:${artifact.name}`)??-1)<artifact.byteLength);
+      if(unread.length)throw new ReviewPreconditionError(unread.map(artifact=>artifact.name));
       const after=snapshotSource(this.project(this.record(input.job_id).projectId).path);
       if(fingerprint(after)!==round.afterHash)throw new Error('Workspace changed after evidence capture; continue with a fresh reviewed revision.');
       if(input.verdict==='pass') {
@@ -154,9 +168,22 @@ export class AutoDev {
         const latest=new Map(tests.map(item=>[item.command,item]));
         if(!latest.size||[...latest.values()].some(item=>item.exit_code!==0||item.status!=='passed'))throw new Error('No complete passing test command evidence for this turn.');
       }
-      round.review={status:input.verdict,summary:redactSensitiveText(input.summary),manifestId:manifest.id,reviewerSession:session,recordedAt:new Date().toISOString()};this.save();
-      return {job_id:input.job_id,review_status:round.review.status,manifest_id:manifest.id,recorded_by:'authenticated MCP client',identity_limit:'The bridge records the authenticated client session; it does not cryptographically attest which model reviewed.'};
-    });
+      return {round,manifest,summary:redactSensitiveText(input.summary)};
+  }
+  async review(session:string,input:ReviewInput) {
+    const preflight=()=>this.reviewPreflight(session,input);
+    return this.execute(input.request_key,{operation:'review',...input},async()=>{
+      // Recheck immediately before the write: journal dispatch has a microtask
+      // boundary where a reader can close or execution evidence can change.
+      // A rejection here proves no verdict mutation, unlike a save failure.
+      let prepared:ReturnType<typeof preflight>;
+      try {prepared=preflight();}catch {throw new JournalDefinitiveError();}
+      const {round,manifest,summary}=prepared;
+      const previousReview=round.review;
+      round.review={status:input.verdict,summary,manifestId:manifest.id,reviewerSession:session,recordedAt:new Date().toISOString()};
+      try {this.save();}catch(error){round.review=previousReview;throw error;}
+      return {job_id:input.job_id,review_status:round.review.status,manifest_id:manifest.id,recorded_by:'authenticated MCP client',identity_limit:'The bridge records the authenticated review connection; it does not cryptographically attest which model reviewed.'};
+    },preflight);
   }
   private pending(jobId:string,turnId:string,requestId:JsonRpcId) {
     this.record(jobId);const job=this.jobs.get(jobId);

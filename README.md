@@ -2,7 +2,7 @@
 
 讓一般 ChatGPT Chat 規劃與審查，由本機 Codex 修改程式、執行測試，並保留可逐頁查核的證據。
 
-目前版本 **0.4.0**。本機橋樑已實作並進行真實 Codex 驗證；**真正 ChatGPT 的 HTTPS／OAuth 掛載與審查仍待實測，整個產品尚未宣告驗收完成**。安裝技能不等於建立連線。
+目前版本 **0.4.0**。已實測一般 ChatGPT 透過 HTTPS／OAuth 交辦、由本機 Codex 修改程式並通過 30 項測試，再由 ChatGPT 讀完完整證據、保存審查通過。**固定日常入口與重啟免重新掛載尚未完成，整個產品尚未宣告驗收完成**。安裝技能不等於建立連線。
 
 從 [joseanu/codex-from-chatgpt](https://github.com/joseanu/codex-from-chatgpt/tree/093bd39ea0770a80612a5184a85b82262759aa00) 的 0.3.1 延伸，保留 MIT 授權及來源歷史。這是社群產品，並非 OpenAI 官方產品。
 
@@ -49,9 +49,9 @@ ProjectPath 請換成你授權的既有 Git 儲存庫根目錄。預設使用可
 
 ## 邊界與尚未驗證項目
 
-一般 ChatGPT 掛載、已授權寫入和親自審查需要實際平台驗收。免費 Quick Tunnel 僅供開發測試，重啟網址改變且 OAuth 授權失效，需重新掛載；固定日常入口尚未完成。iOS，以及聊天回覆結束後自動喚醒原聊天，尚未證實；本服務不宣稱能在背景強迫 ChatGPT 繼續。重新進入聊天時可查既有 job 接續。
+一般 ChatGPT 掛載、唯讀、已授權寫入與親自審查已分別實測；首次審查遇到連線生命週期缺陷，修正後從新連線的一般聊天接續原 job 並保存通過，詳見驗收紀錄。免費 Quick Tunnel 僅供開發測試，重啟網址改變且 OAuth 授權失效，需重新掛載；固定日常入口尚未完成。iOS，以及聊天回覆結束後自動喚醒原聊天，尚未證實；本服務不宣稱能在背景強迫 ChatGPT 繼續。重新進入聊天時可查既有 job 接續。
 
-橋樑記錄 authenticated MCP session 與完整讀取紀錄，不提供「某個特定模型已閱讀」的密碼學證明。測試辨識是命令與結束碼證據，仍需審查實際內容；Codex 自述成功不能代替審查。
+橋樑記錄已驗證 OAuth grant（直接本機連線則為 MCP session）對 manifest 的完整讀取紀錄。同一 grant 可能由多個聊天共用，不能當成某個特定聊天或模型已閱讀的密碼學證明；真正 ChatGPT 審查須另外核對該聊天的工具呼叫。測試辨識是命令與結束碼證據，仍需審查實際內容；Codex 自述成功不能代替審查。
 
 目前完整原始碼證據限於 Git 追蹤或未忽略的 UTF-8 一般檔案，每檔 2 MiB、每專案 32 MiB。認證／私密檔名排除並列明；二進位、非 UTF-8、link 或 token 遮蔽造成內容不完整時，不會宣告完整審查通過。regex 遮蔽只是補充，不能保證偵測所有秘密。專案註冊控制交辦與證據路徑；實際命令仍受 Codex 的平台 sandbox／核准政策約束，不能將 registry 說成額外的 OS 讀取隔離。
 
@@ -65,4 +65,4 @@ npm.cmd run check
 npm.cmd run test:real
 ```
 
-[本輪驗收紀錄](docs/VALIDATION-2026-09-05.md) 區分合成測試、真實 Codex 與尚未完成的 ChatGPT 驗收。[來源與版本](docs/SOURCE.md) 保留上游比較基線；[上游原 README](docs/UPSTREAM-README.md) 僅作來源歷史，不能當成本 fork 的驗收結果。
+[本輪驗收紀錄](docs/VALIDATION-2026-09-05.md) 區分合成測試、真實 Codex、實際 ChatGPT 呼叫與恢復後的審查。[來源與版本](docs/SOURCE.md) 保留上游比較基線；[上游原 README](docs/UPSTREAM-README.md) 僅作來源歷史，不能當成本 fork 的驗收結果。

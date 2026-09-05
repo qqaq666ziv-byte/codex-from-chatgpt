@@ -99,6 +99,43 @@ test("authorization requires one exact client, redirect, scope, audience, state 
   assert.deepEqual(f.gate.pendingRequests(), []);
 });
 
+test("ChatGPT authorization with ui_locales still requires local approval and bound PKCE redemption", () => {
+  const f = fixture();
+  const pending = f.gate.begin(f.params({ ui_locales: "zh-TW" }));
+  assert.deepEqual(f.gate.finish(pending.request_id), { status: "pending" });
+  assert.equal("ui_locales" in pending, false);
+  f.gate.localApproval(pending.request_id, true, pending.verification_code);
+  const finish = f.gate.finish(pending.request_id);
+  assert.ok("redirect_url" in finish);
+  const result = new URL(finish.redirect_url);
+  assert.equal(result.origin + result.pathname, redirect);
+  assert.equal(result.searchParams.get("state"), "opaque-fixture-state");
+  assert.equal(result.searchParams.get("iss"), issuer);
+  assert.equal(result.searchParams.has("ui_locales"), false);
+  const form = new URLSearchParams({ grant_type: "authorization_code", client_id: f.client.client_id, code: result.searchParams.get("code")!, redirect_uri: redirect, resource: `${issuer}/mcp`, code_verifier: "b".repeat(43) });
+  assert.throws(() => f.gate.token(form), error("invalid_grant"));
+  form.set("code_verifier", verifier);
+  const identity = f.gate.verify(f.gate.token(form).access_token);
+  assert.equal(identity.client_id, f.client.client_id);
+  assert.equal(identity.resource, `${issuer}/mcp`);
+  assert.equal(identity.scope, "autodev");
+  assert.doesNotThrow(() => f.gate.begin(f.params({ ui_locales: "zh-Hant-TW en-US" })));
+});
+
+test("ui_locales rejects malformed, excessive and duplicate hints without relaxing authorization parameters", () => {
+  const f = fixture();
+  for (const ui_locales of ["", "zh_TW", "zh-TW\n", " zh-TW", "zh-TW  en-US", "<script>", "en-a", "zh-TW ".repeat(9).trim(), "en-" + "a".repeat(254)]) {
+    assert.throws(() => f.gate.begin(f.params({ ui_locales })), error("invalid_request"));
+  }
+  const duplicate = f.params({ ui_locales: "zh-TW" });
+  duplicate.append("ui_locales", "en-US");
+  assert.throws(() => f.gate.begin(duplicate), error("invalid_request"));
+  assert.throws(() => f.gate.begin(f.params({ ui_locales: "zh-TW", scope: "autodev admin" })), error("invalid_scope"));
+  assert.throws(() => f.gate.begin(f.params({ ui_locales: "zh-TW", resource: `${issuer}/other` })), error("invalid_target"));
+  assert.throws(() => f.gate.begin(f.params({ ui_locales: "zh-TW", unknown_hint: "ignored?" })), error("invalid_request"));
+  assert.deepEqual(f.gate.pendingRequests(), []);
+});
+
 test("code redemption validates PKCE, redirect, resource and client before issuing bound tokens", () => {
   const f = fixture();
   const { form } = f.authorize();

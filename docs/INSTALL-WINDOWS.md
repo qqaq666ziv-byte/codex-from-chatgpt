@@ -54,9 +54,16 @@ pwsh.exe -NoProfile -File .\scripts\connect-chatgpt.ps1 approve -RequestId '這�
 
 回到原 OAuth 瀏覽器頁面完成該次授權，再回 ChatGPT 檢查發現的工具。驗證碼只在本機輸入，不要貼進聊天、公開報告或指令範例。陌生、過期或無法對上的請求不核准；重新檢查自己發起的那一次。這項核准只允許該客戶端連上既有 AutoDev 範圍，不能增加專案 allowlist，也不能代替個別 Codex 執行權限核准。
 
+### 常見連線問題
+
+- 初次建立連線後，ChatGPT 的 Actions 可能暫時顯示沒有工具。完成 OAuth 後，在該連線的設定頁按 **Refresh**，重新取得工具清單；目前應有 9 個 AutoDev actions。看到清單後仍需完成下節的實際呼叫驗證。
+- ChatGPT 可能在授權網址附加 `ui_locales=zh-TW`。本版接受這項選用語系提示，它不會改變核准、權限或 PKCE 驗證。若舊版 gateway 因此回報 `invalid_request`，依「更新與回復」更新程式並重新啟動連線，再從 ChatGPT 發起新的 OAuth；不要手動改寫授權網址。
+
 ### 真實驗證
 
-在新的**一般 ChatGPT 聊天**加入 AutoDev，先交辦：
+從外掛詳細頁按「在聊天中試用」後，明確選取 **「對話」單選項**。本次測試帳號預設進入 Work；切換後網址中的 `surface=work` 可能未立即更新，因此以頁面已選取「對話」為準。
+
+在新對話輸入 `@AutoDev`，從清單選取本次有效連線的外掛，確認輸入框內出現 AutoDev 外掛標籤，再交辦：
 
 > 請使用 AutoDev 列出已登記專案與目前任務，回報實際工具結果，先不要修改檔案。
 
@@ -70,15 +77,17 @@ pwsh.exe -NoProfile -File .\scripts\connect-chatgpt.ps1 approve -RequestId '這�
 pwsh.exe -NoProfile -File .\scripts\connect-chatgpt.ps1 stop
 ```
 
-stop 結束本次開發 HTTPS 連線，本機任務與證據仍保留。再次 run 後先查看新的 status URL，在 ChatGPT 修改或重建開發者連線，並完成該次 OAuth。不要把舊 URL 或舊授權當作新連線已成功。這個重新掛載步驟是目前開發方案的限制，不能宣稱已完成「安裝一次後固定入口免管理」的日常體驗。
+stop 結束本次開發 HTTPS 連線，本機任務與證據仍保留。OAuth gateway 的客戶端註冊（DCR）與授權只存在於記憶體；gateway 停止或重啟後，舊 client ID、access token 與 refresh token 全部失效。
+
+再次 run 後 Quick Tunnel 會換網址。先查看新的 status URL，再於 ChatGPT 以新 URL 重建開發者連線，重新完成 OAuth 與 Refresh。若保留舊 app，將名稱加上「已停止／舊連線」等明確標記，避免新聊天選錯；修改顯示名稱或保留舊工具清單並不會恢復連線。這個重新掛載步驟是目前開發方案的限制，不能宣稱已完成「安裝一次後固定入口免管理」的日常體驗。
 
 本產品不建立開機常駐服務，不要求使用者建立 API Key，也不更換既有登入或新增 API 模型支出。固定網址與完全自動重連仍待符合使用者成本與權限限制的方案驗證。
 
 ## 日常交辦與平台限制
 
-本機 AutoDev 與符合無 API Key 要求的遠端連線完成後，預期可在一般 ChatGPT 直接交辦，例如「請在 demo 修正空值驗證，保留既有介面，執行相關測試並審查結果」。ChatGPT 選取登記的 `project_id`、提交明確需求與驗收條件，保存 job ID，查詢執行狀態並讀取證據。這項日常體驗仍需真正 ChatGPT 入口實測，不能把本機測試當成已交付。
+本機 AutoDev 與遠端連線完成後，可在一般 ChatGPT 直接交辦，例如「請在 demo 修正空值驗證，保留既有介面，執行相關測試並審查結果」。ChatGPT 選取登記的 `project_id`、提交明確需求與驗收條件，保存 job ID，查詢執行狀態並讀取證據。本輪已由真正一般 ChatGPT 交辦隔離專案並讀取完整證據；各層驗收結果見 [驗收紀錄](VALIDATION-2026-09-05.md)，固定日常入口仍待完成。
 
-電腦重開機後先用本機 start／doctor 接續 AutoDev，再啟動開發連線、取得新 URL 並重新掛載 ChatGPT。既有任務不必重送；以 job ID 查詢和接續。每次換 URL 的手動重新掛載，是目前尚未滿足固定日常入口的限制。
+電腦重開機後先用本機 start／doctor 接續 AutoDev，再啟動開發連線、取得新 URL 並重新掛載 ChatGPT。既有任務不必重送；以 job ID 查詢和接續。若舊聊天呼叫新外掛仍回帳號連線錯誤，從新外掛詳細頁按「在聊天中試用」，選「對話」，以正確的新外掛標籤建立聊天，先唯讀核對原 job，再重新讀完整證據。此次實测可用這個流程恢復，不能只靠在舊聊天文字中改寫外掛名稱。每次換 URL 的手動重新掛載，是目前尚未滿足固定日常入口的限制。
 
 服務會保留已完成執行但尚未審查的任務。原聊天回覆結束後自動醒來續審、iOS 的工具支援，都不能由本服務保證。聊天停止時，可在同一或新的已連線聊天說「繼續審查 AutoDev 的 job ……」，重新取得目前證據。不得把 Codex 的完成訊息當成 ChatGPT 已審查通過。
 

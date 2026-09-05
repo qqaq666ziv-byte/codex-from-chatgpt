@@ -4,6 +4,7 @@ import { createServer, request, type IncomingHttpHeaders, type Server } from "no
 import test, { type TestContext } from "node:test";
 
 import { createGateway } from "../src/gateway.js";
+import { ASSERTION_HEADER, SIGNATURE_HEADER, GatewayIdentityVerifier } from "../src/gateway-identity.js";
 
 const issuer = "https://autodev.example";
 const redirectUri = "https://chatgpt.com/connector_platform_oauth_redirect";
@@ -42,13 +43,13 @@ function statusWithHost(url: string, headers: Record<string, string>): Promise<n
 }
 
 async function fixture(t: TestContext) {
-  const requests: Array<{ method: string; url: string; headers: IncomingHttpHeaders; body: string }> = [];
-  let sessionNumber = 0;
+  const requests: Array<{ method: string; url: string; headers: IncomingHttpHeaders; body: string; principal?: string }> = [];
+  const identities = new GatewayIdentityVerifier(adminToken);
   let sse = false;
   const upstream = createServer(async (req, res) => {
     let body = "";
     for await (const chunk of req) body += chunk;
-    requests.push({ method: req.method ?? "", url: req.url ?? "", headers: req.headers, body });
+    requests.push({ method: req.method ?? "", url: req.url ?? "", headers: req.headers, body, principal: identities.verify(req.headers, req.method, req.url, body) });
     if (sse) {
       res.writeHead(200, { "Content-Type": "text/event-stream" });
       res.end("data: should not be forwarded as an SSE response\n\n");
@@ -56,7 +57,6 @@ async function fixture(t: TestContext) {
     }
     if (req.method === "DELETE") { res.writeHead(204); res.end(); return; }
     res.setHeader("Content-Type", "application/json");
-    if (!req.headers["mcp-session-id"]) res.setHeader("mcp-session-id", `fixture-session-${++sessionNumber}`);
     res.end(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { ok: true } }));
   });
   const upstreamPort = await listen(upstream);
@@ -241,7 +241,7 @@ test("OAuth authorization requires the matching local verification code and a bo
   assert.equal(f.requests.length, 0);
 });
 
-test("MCP proxy uses only the internal client credential and binds each session to its OAuth grant", async t => {
+test("MCP proxy signs a stable OAuth grant principal without forwarding client-supplied assertions", async t => {
   const f = await fixture(t);
   for (const authorization of [undefined, "Bearer invalid-access-token", `Bearer ${adminToken}`, `Bearer ${clientToken}`]) {
     const response = await fetch(`${f.publicUrl}/mcp`, { method: "POST", headers: authorization ? { Authorization: authorization } : {}, body: mcpBody });
@@ -254,10 +254,10 @@ test("MCP proxy uses only the internal client credential and binds each session 
   const second = await access(f, client.client_id);
   const initialized = await fetch(`${f.publicUrl}/mcp`, { method: "POST", body: mcpBody, headers: {
     Authorization: `Bearer ${first.access_token}`, "x-admin-token": adminToken, Cookie: "fixture=not-forwarded", "mcp-protocol-version": "2025-03-26",
+    [ASSERTION_HEADER]: "forged-public-assertion", [SIGNATURE_HEADER]: "forged-public-signature",
   } });
   assert.equal(initialized.status, 200);
-  const session = initialized.headers.get("mcp-session-id");
-  assert.ok(session);
+  assert.equal(initialized.headers.get("mcp-session-id"), null);
   const forwarded = f.requests.at(-1)!;
   assert.equal(forwarded.url, "/mcp");
   assert.equal(forwarded.headers.authorization, `Bearer ${clientToken}`);
@@ -265,24 +265,30 @@ test("MCP proxy uses only the internal client credential and binds each session 
   assert.equal(forwarded.headers.cookie, undefined);
   assert.equal(forwarded.headers["mcp-protocol-version"], "2025-03-26");
   assert.equal(forwarded.body, mcpBody);
+  assert.ok(forwarded.principal?.startsWith("gateway:"));
+  assert.notEqual(forwarded.headers[ASSERTION_HEADER], "forged-public-assertion");
+  assert.notEqual(forwarded.headers[SIGNATURE_HEADER], "forged-public-signature");
+  assert.equal(JSON.stringify(forwarded.headers).includes(adminToken), false);
   const beforeCrossGrant = f.requests.length;
-  for (const method of ["POST", "DELETE"]) {
-    const foreign = await fetch(`${f.publicUrl}/mcp`, { method, headers: { Authorization: `Bearer ${second.access_token}`, "mcp-session-id": session }, ...(method === "POST" ? { body: mcpBody } : {}) });
+  for (const token of [first, second]) {
+    const foreign = await fetch(`${f.publicUrl}/mcp`, { method: "POST", headers: { Authorization: `Bearer ${token.access_token}`, "mcp-session-id": "old-or-foreign-session" }, body: mcpBody });
     assert.equal(foreign.status, 404);
   }
   assert.equal(f.requests.length, beforeCrossGrant);
-  const continued = await fetch(`${f.publicUrl}/mcp`, { method: "POST", body: mcpBody, headers: { Authorization: `Bearer ${first.access_token}`, "mcp-session-id": session } });
+  const different = await fetch(`${f.publicUrl}/mcp`, { method: "POST", body: mcpBody, headers: { Authorization: `Bearer ${second.access_token}` } });
+  assert.equal(different.status, 200);
+  assert.notEqual(f.requests.at(-1)!.principal, forwarded.principal);
+  const continued = await fetch(`${f.publicUrl}/mcp`, { method: "POST", body: mcpBody, headers: { Authorization: `Bearer ${first.access_token}` } });
   assert.equal(continued.status, 200);
-  assert.equal(f.requests.at(-1)!.headers["mcp-session-id"], session);
+  assert.equal(f.requests.at(-1)!.principal, forwarded.principal);
   const refresh = await fetch(`${f.publicUrl}/oauth/token`, { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ grant_type: "refresh_token", client_id: client.client_id, refresh_token: first.refresh_token, resource: `${issuer}/mcp` }) });
   assert.equal(refresh.status, 200);
   const refreshed = await refresh.json() as { access_token: string };
-  const resumed = await fetch(`${f.publicUrl}/mcp`, { method: "POST", body: mcpBody, headers: { Authorization: `Bearer ${refreshed.access_token}`, "mcp-session-id": session } });
-  assert.equal(resumed.status, 200, "Refreshing an access token must retain its grant's MCP session");
-  const removed = await fetch(`${f.publicUrl}/mcp`, { method: "DELETE", headers: { Authorization: `Bearer ${refreshed.access_token}`, "mcp-session-id": session } });
-  assert.equal(removed.status, 204);
-  const stale = await fetch(`${f.publicUrl}/mcp`, { method: "POST", body: mcpBody, headers: { Authorization: `Bearer ${refreshed.access_token}`, "mcp-session-id": session } });
-  assert.equal(stale.status, 404);
+  const resumed = await fetch(`${f.publicUrl}/mcp`, { method: "POST", body: mcpBody, headers: { Authorization: `Bearer ${refreshed.access_token}` } });
+  assert.equal(resumed.status, 200, "Refreshing an access token must retain its grant's review principal");
+  assert.equal(f.requests.at(-1)!.principal, forwarded.principal);
+  const removed = await fetch(`${f.publicUrl}/mcp`, { method: "DELETE", headers: { Authorization: `Bearer ${refreshed.access_token}` } });
+  assert.equal(removed.status, 405);
 });
 
 test("gateway rejects GET streaming and never exposes an upstream SSE response", async t => {

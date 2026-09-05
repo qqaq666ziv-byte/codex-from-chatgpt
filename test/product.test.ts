@@ -1,13 +1,14 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, renameSync, rmdirSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import type { AppServerClient, AppServerMessage, JsonRpcId } from "../src/codex-app-server.js";
 import type { EvidenceManifest } from "../src/evidence.js";
 import { JobManager } from "../src/jobs.js";
 import type { LocalConfig } from "../src/local-config.js";
-import { AutoDev } from "../src/product.js";
+import { AutoDev, ReviewPreconditionError } from "../src/product.js";
+import { JournalError } from "../src/journal.js";
 import { StateStore } from "../src/store.js";
 
 const testRoot = path.resolve(".local-tests");
@@ -168,12 +169,83 @@ test("closing a session removes its proof of having read the evidence", async (t
   assert.equal(f.product.status(result.job_id!).review_status, "pending_chatgpt_review");
 });
 
+test("rejected review preflight leaves its key reusable after the same reader finishes all pages", async (t) => {
+  const f = fixture(t);
+  const { result, manifest } = await finished(f);
+  const request = reviewInput(result.job_id!, manifest, "review-corrected-after-reading");
+  await assert.rejects(f.product.review("reviewer", request), (error: unknown) => error instanceof ReviewPreconditionError && error.code === "EVIDENCE_NOT_READ" && error.unread_artifacts.length === manifest.artifacts.length);
+  assert.equal(f.product.journal.list().some(record => record.key === request.request_key), false);
+  const artifact = manifest.artifacts.find(item => item.byteLength > 64)!;
+  f.product.readArtifact("reviewer", manifest.id, artifact.name, undefined, 32);
+  await assert.rejects(f.product.review("reviewer", request), ReviewPreconditionError);
+  assert.equal(f.product.journal.list().some(record => record.key === request.request_key), false);
+  readAll(f.product, "reviewer", manifest);
+  await assert.rejects(f.product.review("reviewer", { ...request, summary: " " }), /summary/i);
+  assert.equal(f.product.journal.list().some(record => record.key === request.request_key), false);
+  const [first, replay] = await Promise.all([f.product.review("reviewer", request), f.product.review("reviewer", request)]);
+  assert.equal(first.review_status, "pass");
+  assert.deepEqual(replay, first);
+  assert.equal(f.product.journal.list().find(record => record.key === request.request_key)?.status, "succeeded");
+  f.product.forgetSession("reviewer");
+  assert.deepEqual(await f.product.review("new-reader-without-receipts", request), first);
+  await assert.rejects(f.product.review("new-reader-without-receipts", { ...request, summary: "A different review body" }), (error: unknown) => error instanceof JournalError && error.code === "CONFLICT");
+});
+
+test("a review queued behind a new turn validates the current revision without poisoning its key", async (t) => {
+  const f = fixture(t);
+  const { result, manifest } = await finished(f);
+  readAll(f.product, "reviewer", manifest);
+  const request = reviewInput(result.job_id!, manifest, "review-after-concurrent-followup");
+  const outcomes = await Promise.allSettled([
+    f.product.continue({ request_key: "concurrent-followup", job_id: result.job_id!, requirements: "繼續修改 value。", acceptance: ["新一輪測試通過"] }),
+    f.product.review("reviewer", request),
+  ]);
+  assert.equal(outcomes[0]!.status, "fulfilled");
+  assert.equal(outcomes[1]!.status, "rejected");
+  assert.equal(f.product.journal.list().some(record => record.key === request.request_key), false);
+  assert.equal(f.product.status(result.job_id!).round, 2);
+  assert.equal(f.product.status(result.job_id!).review_status, "pending_chatgpt_review");
+});
+
+test("a failed durable verdict write remains uncertain and cannot silently retry", async (t) => {
+  const f = fixture(t);
+  const { result, manifest } = await finished(f);
+  readAll(f.product, "reviewer", manifest);
+  const request = reviewInput(result.job_id!, manifest, "review-storage-failure");
+  const statePath = path.join(f.runtimeDir, "product-state.json");
+  const preserved = path.join(f.runtimeDir, "preserved-product-state.json");
+  renameSync(statePath, preserved);
+  mkdirSync(statePath);
+  await assert.rejects(f.product.review("reviewer", request), (error: unknown) => error instanceof JournalError && error.code === "UNCERTAIN");
+  assert.equal(f.product.journal.list().find(record => record.key === request.request_key)?.status, "uncertain");
+  assert.equal(f.product.status(result.job_id!).review_status, "pending_chatgpt_review");
+  rmdirSync(statePath);
+  renameSync(preserved, statePath);
+  const restarted = new AutoDev(f.config, f.manager);
+  assert.equal(restarted.status(result.job_id!).review_status, "pending_chatgpt_review");
+  readAll(restarted, "reviewer", manifest);
+  await assert.rejects(restarted.review("reviewer", request), (error: unknown) => error instanceof JournalError && error.code === "UNCERTAIN");
+});
+
+test("reader expiry at journal dispatch rejects definitively before writing a verdict", async (t) => {
+  const f = fixture(t);
+  const { result, manifest } = await finished(f);
+  readAll(f.product, "expiring-reader", manifest);
+  const request = reviewInput(result.job_id!, manifest, "review-reader-expired-at-dispatch");
+  const review = f.product.review("expiring-reader", request);
+  queueMicrotask(() => f.product.forgetSession("expiring-reader"));
+  await assert.rejects(review, (error: unknown) => error instanceof JournalError && error.code === "FAILED");
+  assert.equal(f.product.journal.list().find(record => record.key === request.request_key)?.status, "failed");
+  assert.equal(f.product.status(result.job_id!).review_status, "pending_chatgpt_review");
+});
+
 test("review rejects source changed after capture and keeps the captured diff immutable", async (t) => {
   const f = fixture(t);
   const { result, manifest } = await finished(f);
   const original = readAll(f.product, "reviewer", manifest);
   writeFileSync(path.join(f.workspace, "source.ts"), "export const value = 99;\n");
   await assert.rejects(f.product.review("reviewer", reviewInput(result.job_id!, manifest, "review-stale-source")));
+  assert.equal(f.product.journal.list().some(record => record.key === "review-stale-source"), false);
   assert.equal(f.product.status(result.job_id!).review_status, "pending_chatgpt_review");
   assert.equal(f.product.seal(result.job_id!).id, manifest.id);
   assert.deepEqual(readAll(f.product, "reviewer", manifest), original);
@@ -190,6 +262,7 @@ test("a previous round's evidence cannot approve the next round and both origina
   assert.notEqual(first.id, second.id);
   assert.notEqual(first.identity.turnId, second.identity.turnId);
   await assert.rejects(f.product.review("reviewer", reviewInput(result.job_id!, first, "review-old-round")));
+  assert.equal(f.product.journal.list().some(record => record.key === "review-old-round"), false);
   await assert.rejects(f.product.review("reviewer", reviewInput(result.job_id!, second, "review-new-unread")));
   const current = readAll(f.product, "reviewer", second);
   const requirements = JSON.parse(current["requirements.json"]!);
@@ -207,6 +280,7 @@ test("pass is rejected for failed tests or commands that merely print the word t
     const manifest = f.product.seal(result.job_id!);
     readAll(f.product, "reviewer", manifest);
     await assert.rejects(f.product.review("reviewer", reviewInput(result.job_id!, manifest, "reject-no-test-evidence")), `A ${options.command} / ${options.exitCode} result must not prove passing tests`);
+    assert.equal(f.product.journal.list().some(record => record.key === "reject-no-test-evidence"), false);
     assert.equal(f.product.status(result.job_id!).review_status, "pending_chatgpt_review");
   }
 });
@@ -291,6 +365,7 @@ test("late execution evidence cannot approve a manifest captured before that evi
     status: "completed", exitCode: 0, aggregatedOutput: "Different evidence only delivered after the review snapshot.\n",
   } } });
   await assert.rejects(f.product.review("reviewer", reviewInput(result.job_id!, manifest, "stale-execution-evidence")));
+  assert.equal(f.product.journal.list().some(record => record.key === "stale-execution-evidence"), false);
   assert.notEqual(f.product.status(result.job_id!).review_status, "pass");
   assert.deepEqual(readAll(f.product, "reviewer", manifest), old);
 });
@@ -335,6 +410,7 @@ test("deleting an omitted binary file does not make incomplete source evidence e
   assert.ok(identity.before.omitted.some((item: { path: string; reason: string }) => item.path === "binary-asset.bin" && item.reason === "binary_requires_separate_review"));
   assert.deepEqual(identity.after.omitted, []);
   await assert.rejects(f.product.review("reviewer", reviewInput(result.job_id!, manifest, "reject-incomplete-before")));
+  assert.equal(f.product.journal.list().some(record => record.key === "reject-incomplete-before"), false);
   assert.equal(f.product.status(result.job_id!).review_status, "pending_chatgpt_review");
 });
 
