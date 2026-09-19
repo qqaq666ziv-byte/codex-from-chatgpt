@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, realpathSync, renameSync, rmdirSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmdirSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import test from "node:test";
 import type { AppServerClient, AppServerMessage, JsonRpcId } from "../src/codex-app-server.js";
@@ -452,4 +453,66 @@ test("stale cancellation cannot interrupt a newer turn", async (t) => {
   assert.equal(f.fake.count("turn/interrupt"), 0);
   assert.equal(f.product.status(result.job_id!).turn_id, current.turn_id);
   assert.equal(f.product.status(result.job_id!).execution_status, "running");
+});
+
+function scopedBinaryTask(f:ReturnType<typeof fixture>,request_key:string) {
+  writeFileSync(path.join(f.workspace,'icon.png'),Buffer.from([0,1,2,3]));
+  execFileSync('git',['add','.'],{cwd:f.workspace,windowsHide:true});
+  execFileSync('git',['-c','user.name=Fixture','-c','user.email=fixture@example.invalid','-c','core.hooksPath=.no-test-hooks','commit','-m','Fixture baseline'],{cwd:f.workspace,windowsHide:true,stdio:'pipe'});
+  const base=execFileSync('git',['rev-parse','HEAD'],{cwd:f.workspace,windowsHide:true,encoding:'utf8'}).trim();
+  return {...task(request_key),requirements:`AutoDev-Review-Scope: ${JSON.stringify({mode:'changes',base_commit:base,excluded_binary_assets:[{path:'icon.png',reason:'Unchanged application icon unrelated to this calculation change.'}],required_binary_paths:[]})}\n${task(request_key).requirements}`};
+}
+
+test('change-scoped review excludes only pinned unchanged binaries, survives restart and becomes stale after asset mutation',async t=>{
+  const f=fixture(t);const input=scopedBinaryTask(f,'scoped-unchanged');
+  const fakeToken=`sk-${'C'.repeat(26)}`;
+  input.requirements=input.requirements.replace('Unchanged application icon',`${fakeToken} Unchanged application icon`);
+  const result=await f.product.submit(input);
+  writeFileSync(path.join(f.workspace,'source.ts'),'export const value = 2;\n');
+  f.fake.complete(result.thread_id!,result.turn_id!,f.workspace);
+  const manifest=f.product.seal(result.job_id!);
+  const restarted=new AutoDev(f.config,f.manager);
+  const contents=readAll(restarted,'reviewer',manifest);
+  assert.equal(JSON.stringify(contents).includes(fakeToken),false);
+  const scope=JSON.parse(contents['review-scope.json']!);
+  assert.equal(scope.declaration.mode,'changes');assert.equal(scope.excluded[0].path,'icon.png');assert.match(scope.excluded[0].sha256,/^[a-f0-9]{64}$/);
+  assert.equal((await restarted.review('reviewer',reviewInput(result.job_id!,manifest,'scoped-pass'))).review_status,'pass');
+  assert.equal(new AutoDev(f.config,f.manager).status(result.job_id!).review_status,'pass');
+  writeFileSync(path.join(f.workspace,'icon.png'),Buffer.from([0,1,2,4]));
+  assert.equal(restarted.status(result.job_id!).review_status,'stale_review');
+  assert.equal(new AutoDev(f.config,f.manager).status(result.job_id!).review_status,'stale_review');
+});
+
+test('changed, new and deleted binary assets remain blocking in a declared change scope',async t=>{
+  for(const operation of ['change','new','delete','late-change'] as const){
+    const f=fixture(t);const result=await f.product.submit(scopedBinaryTask(f,`scoped-${operation}`));
+    if(operation==='change')writeFileSync(path.join(f.workspace,'icon.png'),Buffer.from([0,9]));
+    if(operation==='new')writeFileSync(path.join(f.workspace,'new.png'),Buffer.from([0,9]));
+    if(operation==='delete')unlinkSync(path.join(f.workspace,'icon.png'));
+    f.fake.complete(result.thread_id!,result.turn_id!,f.workspace);
+    const manifest=f.product.seal(result.job_id!);readAll(f.product,'reviewer',manifest);
+    if(operation==='late-change')writeFileSync(path.join(f.workspace,'icon.png'),Buffer.from([0,9]));
+    await assert.rejects(f.product.review('reviewer',reviewInput(result.job_id!,manifest,`reject-${operation}`)),/changed|separate review|disappeared/i);
+    assert.equal(f.product.status(result.job_id!).review_status,'pending_chatgpt_review');
+  }
+});
+
+test('binary modified before dispatch cannot hide behind the current task baseline',async t=>{
+  const f=fixture(t);const input=scopedBinaryTask(f,'preexisting-binary-change');
+  writeFileSync(path.join(f.workspace,'icon.png'),Buffer.from([0,9]));
+  await assert.rejects(f.product.submit(input),/changed from base_commit|outcome/i);
+  assert.equal(f.fake.count('turn/start'),0);
+});
+
+test('legacy omitted binary state without hashes cannot acquire a pass after restart',async t=>{
+  const f=fixture(t);const result=await f.product.submit(scopedBinaryTask(f,'legacy-binary'));
+  f.fake.complete(result.thread_id!,result.turn_id!,f.workspace);
+  const filename=path.join(f.runtimeDir,'product-state.json');
+  const envelope=JSON.parse(readFileSync(filename,'utf8'));
+  const round=envelope.state.records[0].rounds[0];
+  delete round.reviewScope;delete round.before.omitted[0].sha256;delete round.before.omitted[0].bytes;
+  envelope.checksum=createHash('sha256').update(JSON.stringify(envelope.state)).digest('hex');
+  writeFileSync(filename,JSON.stringify(envelope));
+  const restarted=new AutoDev(f.config,f.manager);const manifest=restarted.seal(result.job_id!);readAll(restarted,'reviewer',manifest);
+  await assert.rejects(restarted.review('reviewer',reviewInput(result.job_id!,manifest,'reject-legacy')),/separate review/);
 });

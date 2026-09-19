@@ -5,10 +5,10 @@ import { createHash } from 'node:crypto';
 import { createTwoFilesPatch } from 'diff';
 import { redactSensitiveText } from './evidence.js';
 
-export type SourceSnapshot={head:string|null;files:Record<string,{sha256:string;content:string}>;omitted:Array<{path:string;reason:string}>};
+export type SourceSnapshot={head:string|null;files:Record<string,{sha256:string;content:string}>;omitted:Array<{path:string;reason:string;sha256?:string;bytes?:number}>};
 const sha=(value:string|Buffer)=>createHash('sha256').update(value).digest('hex');
 function git(cwd:string,args:string[]):string { return execFileSync('git',['--no-optional-locks',...args],{cwd,windowsHide:true,encoding:'utf8',maxBuffer:8*1024*1024,stdio:['ignore','pipe','pipe']}); }
-const sensitivePath=/(^|\/)(\.env(?:\..*)?|\.git|\.runtime|\.local-tests|\.ai-bridge|\.npmrc|\.netrc|\.pypirc|\.ssh|\.aws|\.kube|auth\.json|credentials?(?:\..*)?|.*\.pem|.*\.key|client-token|admin-token)(\/|$)/i;
+export const sensitivePath=/(^|\/)(\.env(?:\..*)?|\.git|\.runtime|\.local-tests|\.ai-bridge|\.npmrc|\.netrc|\.pypirc|\.ssh|\.aws|\.kube|auth\.json|credentials?(?:\..*)?|.*\.pem|.*\.key|client-token|admin-token)(\/|$)/i;
 export function snapshotSource(workspace:string,allowUnversioned=false):SourceSnapshot {
   const root=realpathSync(workspace);
   const files:SourceSnapshot['files']={}; const omitted:SourceSnapshot['omitted']=[]; let bytes=0;
@@ -44,8 +44,8 @@ export function snapshotSource(workspace:string,allowUnversioned=false):SourceSn
     const canonical=realpathSync(file); if(canonical!==file && (process.platform!=='win32'||canonical.toLowerCase()!==file.toLowerCase())) throw new Error('Source path resolves through a link; evidence capture refused.');
     bytes+=stat.size; if(stat.size>2*1024*1024||bytes>32*1024*1024) throw new Error('Source evidence exceeds 2 MiB/file or 32 MiB/project limit; narrow the registered repository.');
     const raw=readFileSync(file);
-    if(raw.includes(0)) {omitted.push({path:name,reason:'binary_requires_separate_review'});continue;}
-    const text=raw.toString('utf8'); if(!Buffer.from(text).equals(raw)) {omitted.push({path:name,reason:'non_utf8_requires_separate_review'});continue;}
+    if(raw.includes(0)) {omitted.push({path:name,reason:'binary_requires_separate_review',sha256:sha(raw),bytes:raw.length});continue;}
+    const text=raw.toString('utf8'); if(!Buffer.from(text).equals(raw)) {omitted.push({path:name,reason:'non_utf8_requires_separate_review',sha256:sha(raw),bytes:raw.length});continue;}
     const content=redactSensitiveText(text);
     if(content!==text) omitted.push({path:name,reason:'known_token_patterns_redacted'});
     files[name]={sha256:sha(raw),content};
