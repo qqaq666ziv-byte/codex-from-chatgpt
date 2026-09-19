@@ -2,10 +2,13 @@ import { readFileSync, realpathSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { timingSafeEqual } from 'node:crypto';
 import { z } from 'zod';
+import { effortSchema, routingPolicySchema } from './model-routing.js';
 
 const schema = z.object({
   schemaVersion: z.literal(1), host: z.literal('127.0.0.1'), port: z.number().int().min(1024).max(65535),
-  model: z.string().min(1), reasoningEffort: z.enum(['low','medium','high','xhigh','max','ultra']),
+  model: z.string().min(1), reasoningEffort: effortSchema,
+  routingPolicy:routingPolicySchema.optional(),
+  projectCreationRoot:z.string().min(1).optional(),
   projects: z.array(z.object({id:z.string().regex(/^[a-z0-9][a-z0-9_-]{0,63}$/),name:z.string().min(1),path:z.string().min(1)})),
 });
 export type LocalConfig = z.infer<typeof schema> & {runtimeDir:string;configPath:string};

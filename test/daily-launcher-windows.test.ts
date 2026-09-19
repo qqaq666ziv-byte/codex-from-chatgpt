@@ -33,7 +33,9 @@ function fixture() {
   for (const directory of [scripts, runtime, dist, path.join(root, '.tools')]) mkdirSync(directory, { recursive: true });
   copyFileSync(path.join(product, 'Start-AutoDev.cmd'), path.join(root, 'Start-AutoDev.cmd'));
   copyFileSync(path.join(product, 'scripts', 'start-daily.ps1'), path.join(scripts, 'start-daily.ps1'));
-  for (const name of ['local-common.ps1', 'backup-common.ps1']) writeFileSync(path.join(scripts, name), '# synthetic unused prerequisite');
+  copyFileSync(path.join(product, 'scripts', 'manage-daily.ps1'), path.join(scripts, 'manage-daily.ps1'));
+  copyFileSync(path.join(product, 'scripts', 'local-common.ps1'), path.join(scripts, 'local-common.ps1'));
+  writeFileSync(path.join(scripts, 'backup-common.ps1'), '# synthetic unused prerequisite');
   writeFileSync(path.join(root, 'package.json'), '{"type":"module"}');
   for (const name of ['fixed-tunnel', 'local-config']) {
     const output = buildSync({ entryPoints: [path.join(product, 'src', `${name}.ts`)], bundle: true, packages: 'external', platform: 'node', format: 'esm', write: false }).outputFiles[0]!.text;
@@ -57,6 +59,10 @@ $state = Get-Content -LiteralPath (Join-Path $r 'synthetic-scenario.json') -Raw 
   writeFileSync(path.join(scripts, 'autodev.ps1'), `\ufeffparam([string]$Command)\n${common}
 Add-Content -LiteralPath (Join-Path $r 'synthetic-events.jsonl') -Value ('core:' + $Command)
 Write-Output '${privateText}'
+if ($state.background) {
+  $child = Start-Process -FilePath (Get-Command node.exe).Source -ArgumentList @('-e','"setTimeout(()=>{},20000)"') -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $r 'child.stdout.log') -RedirectStandardError (Join-Path $r 'child.stderr.log')
+  Set-Content -LiteralPath (Join-Path $r 'child.pid') -Value $child.Id
+}
 if ($state.delay) { Start-Sleep -Milliseconds $state.delay }
 exit ([int]$state.coreExit)
 `);
@@ -110,6 +116,13 @@ for (const shell of ['powershell.exe', 'pwsh.exe']) {
     assert.deepEqual(f.entries(), ['core:start', 'fixed:start', 'fixed:status']); assertPrivate(success.output);
     assert.match(success.output, /FIXED-ENTRY-VALIDATION/);
     assert.equal(readFileSync(f.config, 'utf8'), JSON.stringify(f.validConfig));
+    f.setScenario({ background: true });
+    const backgroundStart = Date.now();
+    const background = await f.launch(shell);
+    assert.equal(background.code, 0, background.output);
+    assert.ok(Date.now() - backgroundStart < 18_000, 'launcher waited for background descendants');
+    const childPid = Number(readFileSync(path.join(f.runtime, 'child.pid'), 'utf8').replace(/^\uFEFF/, '').trim());
+    process.kill(childPid, 0); // The fixture child remains alive and exits itself.
     f.setScenario({ coreExit: 37 });
     const coreFailure = await f.launch(shell); assert.equal(coreFailure.code, 37, coreFailure.output); assertPrivate(coreFailure.output);
     assert.deepEqual(f.entries(), ['core:start']);

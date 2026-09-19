@@ -2,12 +2,14 @@ import { execFileSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { closeSync, fsyncSync, lstatSync, openSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
+import { OAUTH_LEGACY_GRANT_MS as GRANT_MS, OAUTH_LEGACY_MAX_ROTATIONS as ROTATIONS, OAUTH_ACCESS_MS as ACCESS_MS, OAUTH_MAX_ACCESS_TOKENS } from './oauth-policy.js';
 
 export type OAuthStoredClient = { id: string; name: string; redirects: string[] };
-export type OAuthStoredGrant = { id: string; clientId: string; expiresAt: number; rotations: number };
-export type OAuthStoredToken = { grantId: string; expiresAt: number };
+export type OAuthStoredGrant = { id: string; clientId: string; rotations: number } &
+  ({ expiresAt: number } | { expiresAt: null; refreshKey: string });
+export type OAuthStoredToken = { grantId: string; expiresAt: number | null; generation?: number };
 export type OAuthPersistentState = {
-  schemaVersion: 1; issuer: string; writtenAt: number;
+  schemaVersion: 1 | 2; issuer: string; writtenAt: number;
   clients: OAuthStoredClient[]; grants: OAuthStoredGrant[];
   accessTokens: [string, OAuthStoredToken][]; refreshTokens: [string, OAuthStoredToken][];
   usedRefresh: [string, OAuthStoredToken][]; usedCodes: [string, OAuthStoredToken][];
@@ -23,9 +25,6 @@ export class OAuthStateError extends Error {
 
 const MAX_BYTES = 4 * 1024 * 1024;
 const CAPACITY = 32;
-const ROTATIONS = 64;
-const GRANT_MS = 8 * 60 * 60_000;
-const ACCESS_MS = 10 * 60_000;
 const object = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === 'object' && !Array.isArray(v);
 const exact = (v: Record<string, unknown>, keys: string) => Object.keys(v).sort().join(',') === keys.split(',').sort().join(',');
 const time = (v: unknown): v is number => typeof v === 'number' && Number.isSafeInteger(v) && v >= 0;
@@ -48,7 +47,7 @@ function redirect(value: unknown): value is string {
 /** Validate structure and security bindings before any restored authorization is usable. */
 export function validateOAuthState(value: unknown, issuer: string, now: number): OAuthPersistentState {
   try {
-    if (!canonicalIssuer(issuer) || !time(now) || !object(value) || !exact(value, 'schemaVersion,issuer,writtenAt,clients,grants,accessTokens,refreshTokens,usedRefresh,usedCodes') || value.schemaVersion !== 1 || value.issuer !== issuer || !time(value.writtenAt) || value.writtenAt > now) throw 0;
+    if (!canonicalIssuer(issuer) || !time(now) || !object(value) || !exact(value, 'schemaVersion,issuer,writtenAt,clients,grants,accessTokens,refreshTokens,usedRefresh,usedCodes') || (value.schemaVersion !== 1 && value.schemaVersion !== 2) || value.issuer !== issuer || !time(value.writtenAt) || value.writtenAt > now) throw 0;
     if (!Array.isArray(value.clients) || value.clients.length > CAPACITY || !Array.isArray(value.grants) || value.grants.length > CAPACITY) throw 0;
     const clients = new Map<string, OAuthStoredClient>();
     for (const client of value.clients) {
@@ -57,21 +56,29 @@ export function validateOAuthState(value: unknown, issuer: string, now: number):
     }
     const grants = new Map<string, OAuthStoredGrant>();
     for (const grant of value.grants) {
-      if (!object(grant) || !exact(grant, 'id,clientId,expiresAt,rotations') || !opaque(grant.id) || typeof grant.clientId !== 'string' || !clients.has(grant.clientId) || !time(grant.expiresAt) || grant.expiresAt > value.writtenAt + GRANT_MS || !time(grant.rotations) || grant.rotations > ROTATIONS || grants.has(grant.id)) throw 0;
+      if (!object(grant) || !opaque(grant.id) || typeof grant.clientId !== 'string' || !clients.has(grant.clientId) || !time(grant.rotations) || grants.has(grant.id)) throw 0;
+      if (grant.expiresAt === null) {
+        if (value.schemaVersion !== 2 || !exact(grant, 'id,clientId,expiresAt,rotations,refreshKey') || !opaque(grant.refreshKey)) throw 0;
+      } else if (!exact(grant, 'id,clientId,expiresAt,rotations') || !time(grant.expiresAt) || grant.expiresAt > value.writtenAt + GRANT_MS || grant.rotations > ROTATIONS) throw 0;
       grants.set(grant.id, grant as OAuthStoredGrant);
     }
     const seen = new Set<string>();
     const counts = new Map<string, { refresh: number; used: number; code: number }>();
     for (const name of ['accessTokens', 'refreshTokens', 'usedRefresh', 'usedCodes'] as const) {
       const entries = value[name];
-      const maximum = name === 'refreshTokens' || name === 'usedCodes' ? CAPACITY : CAPACITY * (ROTATIONS + 1);
+      const maximum = name === 'accessTokens' ? OAUTH_MAX_ACCESS_TOKENS : name === 'usedRefresh' ? CAPACITY * ROTATIONS : CAPACITY;
       if (!Array.isArray(entries) || entries.length > maximum) throw 0;
       for (const entry of entries) {
-        if (!Array.isArray(entry) || entry.length !== 2 || typeof entry[0] !== 'string' || !/^[a-f0-9]{64}$/.test(entry[0]) || seen.has(entry[0]) || !object(entry[1]) || !exact(entry[1], 'grantId,expiresAt')) throw 0;
+        if (!Array.isArray(entry) || entry.length !== 2 || typeof entry[0] !== 'string' || !/^[a-f0-9]{64}$/.test(entry[0]) || seen.has(entry[0]) || !object(entry[1])) throw 0;
         seen.add(entry[0]);
         const ref = entry[1];
         const grant = typeof ref.grantId === 'string' ? grants.get(ref.grantId) : undefined;
-        if (!grant || !time(ref.expiresAt) || ref.expiresAt > grant.expiresAt || (name === 'accessTokens' && ref.expiresAt > value.writtenAt + ACCESS_MS) || (name !== 'accessTokens' && ref.expiresAt !== grant.expiresAt)) throw 0;
+        if (!grant) throw 0;
+        const generated = name === 'refreshTokens' && grant.expiresAt === null;
+        if (!exact(ref, generated ? 'grantId,expiresAt,generation' : 'grantId,expiresAt') || (generated && ref.generation !== grant.rotations)) throw 0;
+        if (name === 'accessTokens') {
+          if (!time(ref.expiresAt) || ref.expiresAt > value.writtenAt + ACCESS_MS || (grant.expiresAt !== null && ref.expiresAt > grant.expiresAt)) throw 0;
+        } else if (ref.expiresAt !== grant.expiresAt || (name === 'usedRefresh' && grant.expiresAt === null)) throw 0;
         const count = counts.get(grant.id) ?? { refresh: 0, used: 0, code: 0 };
         if (name === 'refreshTokens') count.refresh++;
         if (name === 'usedRefresh') count.used++;
@@ -81,7 +88,7 @@ export function validateOAuthState(value: unknown, issuer: string, now: number):
     }
     for (const grant of grants.values()) {
       const count = counts.get(grant.id);
-      if (!count || count.refresh !== 1 || count.used !== grant.rotations || count.code !== 1) throw 0;
+      if (!count || count.refresh !== 1 || count.used !== (grant.expiresAt === null ? 0 : grant.rotations) || count.code !== 1) throw 0;
     }
     return JSON.parse(JSON.stringify(value)) as OAuthPersistentState;
   } catch { throw new OAuthStateError('OAuth state schema, issuer, clock or grant bindings are invalid; the original state was preserved.'); }

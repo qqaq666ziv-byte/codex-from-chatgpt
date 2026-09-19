@@ -1,4 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams, type SpawnOptions } from "node:child_process";
+import { codexProcess } from './codex-process.js';
+import { codexWindowsJob } from './codex-windows-job.js';
 
 import type { InitializeParams } from "../protocol/codex-0.147.0-ts/InitializeParams.js";
 
@@ -48,6 +50,8 @@ type ChildLifecycle = {
   intentionalStop: boolean;
   exitNotified: boolean;
   originalFailure: Error | null;
+  ownedWindowsJob: boolean;
+  shutdownUnconfirmed: boolean;
 };
 
 type MessageListener = (message: AppServerMessage) => void;
@@ -118,7 +122,7 @@ export class CodexAppServer implements AppServerClient {
 
   constructor(options: string | CodexAppServerOptions = {}) {
     const normalized: CodexAppServerOptions = typeof options === "string" ? { command: options } : options;
-    this.command = normalized.command ?? process.env.CODEX_BIN ?? "codex";
+    this.command = normalized.command ?? process.env.AUTODEV_CODEX_EXECUTABLE ?? process.env.CODEX_BIN ?? "codex";
     this.commandArgs = normalized.commandArgs ?? ["app-server", "--stdio"];
     this.rpcTimeoutMs = parseDuration(normalized.rpcTimeoutMs, Number(process.env.CODEX_RPC_TIMEOUT_MS) || 30_000);
     this.shutdownTimeoutMs = parseDuration(normalized.shutdownTimeoutMs, Number(process.env.CODEX_SHUTDOWN_TIMEOUT_MS) || 2_000);
@@ -210,16 +214,23 @@ export class CodexAppServer implements AppServerClient {
   }
 
   private async startInternal(): Promise<void> {
+    // A failed stop/protocol teardown must not be overwritten by a new child.
+    if (this.current) await this.stopLifecycle(this.current);
     this.initialized = false;
     this.lastError = null;
     this.lineBuffer = "";
     this.stderrTail = "";
 
-    const child = this.spawnProcess(this.command, this.commandArgs, {
+    const launch = codexProcess(this.command, this.commandArgs, this.spawnOptions.env ?? process.env);
+    const launchOptions: SpawnOptions = {
       env: process.env,
       stdio: ["pipe", "pipe", "pipe"],
       ...this.spawnOptions,
-    }) as ChildProcessWithoutNullStreams;
+      ...launch.options,
+    };
+    const owner = process.platform === 'win32' ? codexWindowsJob(launch.command, launch.args, launchOptions, this.shutdownTimeoutMs) : undefined;
+    const child = this.spawnProcess(owner?.command ?? launch.command, owner?.args ?? launch.args,
+      owner?.options ?? launchOptions) as ChildProcessWithoutNullStreams;
     let resolveExit!: () => void;
     const lifecycle: ChildLifecycle = {
       child,
@@ -228,11 +239,11 @@ export class CodexAppServer implements AppServerClient {
       intentionalStop: false,
       exitNotified: false,
       originalFailure: null,
+      ownedWindowsJob: owner !== undefined,
+      shutdownUnconfirmed: false,
     };
     this.current = lifecycle;
 
-    child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => this.consumeStdout(chunk, lifecycle));
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (chunk: string) => {
       if (this.current === lifecycle) this.stderrTail = `${this.stderrTail}${chunk}`.slice(-4000);
@@ -242,8 +253,13 @@ export class CodexAppServer implements AppServerClient {
       this.failAll(new Error(`No se pudo iniciar codex app-server: ${error.message}`), true, lifecycle);
     });
     child.once("close", (code, signal) => this.handleClose(lifecycle, code, signal));
+    child.stdin.on('error', () => { /* Pending requests/owned shutdown report fixed failures. */ });
 
     try {
+      if (owner) await owner.prepare(child);
+      child.stdout.setEncoding("utf8");
+      child.stdout.on("data", (chunk: string) => this.consumeStdout(chunk, lifecycle));
+      child.stdout.resume();
       const initializeParams: InitializeParams = {
         clientInfo: { name: "codex-agent-mcp", title: "Codex Agent", version: "0.3.1" },
         capabilities: { experimentalApi: true, requestAttestation: false },
@@ -262,8 +278,30 @@ export class CodexAppServer implements AppServerClient {
 
   private async stopLifecycle(lifecycle: ChildLifecycle): Promise<void> {
     const child = lifecycle.child;
+    const unconfirmed = () => {
+      lifecycle.shutdownUnconfirmed = true;
+      this.current = lifecycle;
+      throw new Error('Owned Codex shutdown was not confirmed; a replacement child is blocked.');
+    };
+    if (lifecycle.ownedWindowsJob) {
+      // EOF reaches the native app-server first. The helper owns an atomic
+      // KILL_ON_JOB_CLOSE job and waits for zero active descendants before exit.
+      if (child.exitCode === null && child.signalCode === null) {
+        try { child.stdin.end(); } catch { /* Exit verification remains required. */ }
+      }
+      if (!await this.waitForExit(lifecycle, Math.max(15000, this.shutdownTimeoutMs + 12000))) {
+        // This exact helper handle owns the only job handle. Its death closes
+        // that job; an unacknowledged shutdown is still never reported success.
+        if (child.exitCode === null && child.signalCode === null) try { child.kill('SIGKILL'); } catch { /* Preserve failure. */ }
+        await this.waitForExit(lifecycle, this.killTimeoutMs);
+        return unconfirmed();
+      }
+      if (child.exitCode !== 0 || child.signalCode !== null || lifecycle.shutdownUnconfirmed) return unconfirmed();
+      if (this.current === lifecycle) this.current = null;
+      return;
+    }
     if (child.exitCode !== null) {
-      await lifecycle.exit;
+      if (!await this.waitForExit(lifecycle, this.killTimeoutMs)) return unconfirmed();
       return;
     }
     try {
@@ -275,7 +313,7 @@ export class CodexAppServer implements AppServerClient {
     try { child.kill("SIGTERM"); } catch { /* Best effort. */ }
     if (await this.waitForExit(lifecycle, this.killTimeoutMs)) return;
     try { child.kill("SIGKILL"); } catch { /* Best effort. */ }
-    await this.waitForExit(lifecycle, this.killTimeoutMs);
+    if (!await this.waitForExit(lifecycle, this.killTimeoutMs)) return unconfirmed();
   }
 
   private async waitForExit(lifecycle: ChildLifecycle, timeoutMs: number): Promise<boolean> {
@@ -292,13 +330,14 @@ export class CodexAppServer implements AppServerClient {
   private handleClose(lifecycle: ChildLifecycle, code: number | null, signal: NodeJS.Signals | null): void {
     lifecycle.resolveExit();
     if (this.current !== lifecycle) return;
+    if (lifecycle.ownedWindowsJob && (signal !== null || code === 74)) lifecycle.shutdownUnconfirmed = true;
     if (!lifecycle.intentionalStop && !lifecycle.exitNotified) {
       const suffix = signal ? `señal ${signal}` : `código ${code ?? "desconocido"}`;
       const failure = lifecycle.originalFailure ?? new Error(`codex app-server terminó inesperadamente (${suffix}).`);
       this.failAll(failure, false, lifecycle);
       this.notifyExit(lifecycle, failure);
     }
-    this.current = null;
+    if (!lifecycle.shutdownUnconfirmed) this.current = null;
     this.initialized = false;
   }
 
@@ -384,10 +423,9 @@ export class CodexAppServer implements AppServerClient {
   private protocolFailure(error: Error): void {
     const lifecycle = this.current;
     this.failAll(error, true, lifecycle);
-    const child = lifecycle?.child;
-    if (child && child.exitCode === null) {
-      try { child.kill("SIGTERM"); } catch { /* close handler performs cleanup */ }
-    }
+    // Serialize whole-tree cleanup. Killing only cmd.exe would orphan its
+    // app-server descendants and let a later start replace a live lifecycle.
+    void this.stop().catch(() => { /* stopLifecycle retains the blocked owner. */ });
   }
 
   private failAll(error: Error, notify: boolean, lifecycle = this.current): void {

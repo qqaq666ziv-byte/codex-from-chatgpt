@@ -1,7 +1,8 @@
 import { CodexAppServer } from '../src/codex-app-server.js';
+import { ModelCatalog } from '../src/model-routing.js';
 const client = new CodexAppServer({ spawnOptions: { windowsHide: true }, rpcTimeoutMs: 30_000 });
 await client.start();
 try {
-  const result = await client.request<{data: Array<Record<string, unknown>>;nextCursor?: string|null}>('model/list', {limit: 100, includeHidden: false});
-  console.log(JSON.stringify({models:result.data.map(m=>({id:m.id,model:m.model,isDefault:m.isDefault,defaultReasoningEffort:m.defaultReasoningEffort,supportedReasoningEfforts:m.supportedReasoningEfforts})),nextCursor:result.nextCursor},null,2));
+  const result=await new ModelCatalog(client,300000,Date.now,true).get();
+  console.log(JSON.stringify({models:result.models,fetchedAt:result.fetchedAt,expiresAt:result.expiresAt,turnEffectiveConfirmation:'unavailable in Codex App Server 0.153.4 Turn response'},null,2));
 } finally { await client.stop(); }

@@ -1,6 +1,6 @@
 # AutoDev 0.4.2 固定入口
 
-固定入口使用 Cloudflare Workers Free、Workers KV 與免費 `workers.dev` 位址。內部 Quick Tunnel 可以在重啟後更換位址；ChatGPT App 的 MCP URL 與 OAuth issuer 保持相同。既有 core 與 Codex 執行流程不變，沿用既有 ChatGPT／Codex 登入及 `gpt-6-astra`／`xhigh`。
+固定入口使用 Cloudflare Workers Free、Workers KV 與免費 `workers.dev` 位址。內部 Quick Tunnel 可以在重啟後更換位址；ChatGPT App 的 MCP URL 與 OAuth issuer 保持相同。沿用既有 ChatGPT／Codex 登入；未提供路由提示時維持 `gpt-6-astra`／`xhigh`，每回合選擇見 [MODEL-ROUTING.md](MODEL-ROUTING.md)。2026-09-06 的啟動修復、自啟與當日 App 授權狀態見 [交付報告](DELIVERY-2026-09-06.md)；下列 2026-09-05 結果保留為歷史證據。
 
 2026-09-05 已從實際帳號 UI 確認 Workers Free／$0；固定 Worker 已部署，真實固定入口的 metadata 已就緒並通過本次 instance 核對。同日 17:23 已完成一般 ChatGPT 的 OAuth／端到端工作驗收：同一請求 key 重送保持同一 job／turn、Codex 完成變更、該工作 46 項測試通過、四份 artifact 完成，以及持久保存的 review pass。17:26 core 與固定 gateway／cloudflared 全部正常重啟後，同一 App 無重新 OAuth、無改 URL 即讀回相同任務、證據與 PASS。**完整驗收見 [FIXED-ENTRY-VALIDATION.md](FIXED-ENTRY-VALIDATION.md)**。固定入口為日常路徑；原 Quick App 明確標記為備援，沒有刪除原程序或歷史證據。
 
@@ -155,7 +155,7 @@ Workers 與 KV 配額見 [Workers 價格](https://developers.cloudflare.com/work
 
 ## OAuth 持久化與復原
 
-固定 gateway 使用 `.runtime/fixed-oauth.dpapi` 保存 DCR client、grant、雜湊 token 及必要的已使用狀態，綁定目前 Windows 使用者與固定 issuer。有效 access token 最長 10 分鐘；同一 grant 最長 8 小時，最多 64 次 refresh rotation。有效授權可跨正常 gateway 重啟保留，refresh 沿用同一 grant 身分。grant 到期或 rotation 用完後，從既有 App 重新授權並完成本機同意；不需建立新 App。此 grant 身分不等同單一 ChatGPT 對話 ID。
+固定 gateway 使用 `.runtime/fixed-oauth.dpapi` 保存 DCR client、grant、token 雜湊與每筆授權的 refresh 簽章金鑰，綁定目前 Windows 使用者與固定 issuer。2026-09-12 起新授權持續有效直到撤銷，沒有固定天數或一般 refresh 次數上限；access token 最長 10 分鐘。新 schema 2 的 grant 使用明確的 `expiresAt: null`，每筆保留目前 refresh 世代；HMAC-SHA256 綁定 issuer、resource、client、scope 與世代，可撤銷舊 token 重放的整組授權，無須累積全部舊 token。金鑰受 DPAPI 保護；總資料仍限制為 4 MiB，client/grant 各 32 筆、有效 access token 最多 4096 筆。舊 schema 1 可讀取並保留原 8 小時／64 次限制，不能因升級延長、復活或自動轉成永久授權。正常重啟及 refresh 保留同一 grant 身分；此身分不等同單一 ChatGPT 對話 ID。設計保留 [OAuth 安全最佳實務的 refresh rotation 與撤銷要求](https://www.rfc-editor.org/rfc/rfc9700.html#section-4.14)。
 
 待同意請求與尚未兌換的 authorization code 不跨重啟保存；中途重啟時重新發起該次授權流程。不要依賴舊頁面的 code。
 

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import { promisify } from 'node:util';
@@ -22,9 +22,11 @@ for (const shell of ['powershell.exe', 'pwsh.exe']) {
     mkdirSync(scripts); mkdirSync(dist, { recursive: true });
     writeFileSync(path.join(directory, 'package.json'), '{"type":"module"}');
     for (const name of ['secure-tunnel.ps1', 'local-common.ps1']) copyFileSync(path.join(product, 'scripts', name), path.join(scripts, name));
-    for (const name of ['secure-tunnel-runner', 'secure-tunnel', 'secure-process', 'local-config', 'runtime-lock', 'windows-job', 'cost-policy']) {
-      const text = readFileSync(path.join(product, 'src', name + '.ts'), 'utf8');
-      writeFileSync(path.join(dist, name + '.js'), transformSync(text, { loader: 'ts', target: 'es2022', format: 'esm' }).code);
+    // Keep the same complete module graph as the product build. local-config
+    // now validates routing policy through model-routing and its dependencies.
+    for (const name of readdirSync(path.join(product, 'src')).filter(name => name.endsWith('.ts'))) {
+      const text = readFileSync(path.join(product, 'src', name), 'utf8');
+      writeFileSync(path.join(dist, name.replace(/\.ts$/, '.js')), transformSync(text, { loader: 'ts', target: 'es2022', format: 'esm' }).code);
     }
     const launcher = path.join(scripts, 'secure-tunnel.ps1');
     const invoke = (...args: string[]) => run(shell, ['-File', launcher, ...args]);

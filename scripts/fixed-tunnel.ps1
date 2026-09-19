@@ -1,8 +1,9 @@
 [CmdletBinding()]
 param(
-  [Parameter(Position=0)][ValidateSet('setup','configure','credential','start','run','status','doctor','stop','restart','approve','deny','connection-info','help')][string]$Action='help',
+  [Parameter(Position=0)][ValidateSet('setup','configure','credential','start','run','status','doctor','stop','restart','approve','deny','grants','revoke','connection-info','help')][string]$Action='help',
   [Parameter(Position=1)][string]$RequestId,
   [Parameter(Position=2)][string]$VerificationCode,
+  [string]$GrantId,
   [string]$WorkerOrigin,
   [string]$EvidenceUrl,
   [ValidateSet('free-service','free-tier','free-credits')][string]$CostBasis='free-tier',
@@ -20,7 +21,7 @@ $ErrorActionPreference='Stop'
 $AutoDevRoot=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..')).TrimEnd('\')
 $AutoDevRuntime=Join-Path $AutoDevRoot '.runtime'
 $AutoDevEntry=Join-Path $AutoDevRoot 'dist\src\fixed-tunnel-runner.js'
-$AutoDevNode=(Get-Command node.exe -ErrorAction Stop).Source
+$AutoDevNode=Resolve-AutoDevNode
 function Invoke-FixedCommand([string[]]$Values) {
   & $AutoDevNode $AutoDevEntry @Values
   Assert-AutoDevExit 'Fixed Cloudflare connection operation' $LASTEXITCODE
@@ -84,6 +85,11 @@ try {
     throw 'Fixed gateway launch was not confirmed within four minutes. Use status before retrying; no second supervisor was launched.'
   }
   if ($Action -eq 'run') { Invoke-FixedCommand @('run',('--autodev-fixed-instance='+[Guid]::NewGuid().ToString())); return }
+  if ($Action -eq 'revoke') {
+    if ($GrantId -cnotmatch '^[A-Za-z0-9_-]{43}$') { throw 'Provide a grant ID listed by the grants action.' }
+    Invoke-FixedCommand @('revoke',$GrantId)
+    return
+  }
   if ($Action -in @('approve','deny')) {
     if ([string]::IsNullOrWhiteSpace($RequestId) -or [string]::IsNullOrWhiteSpace($VerificationCode)) { throw 'Provide the matching request ID and verification code from the OAuth page.' }
     Invoke-FixedCommand @($Action,$RequestId,$VerificationCode)

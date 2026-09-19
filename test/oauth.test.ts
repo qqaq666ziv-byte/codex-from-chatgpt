@@ -201,16 +201,16 @@ test("pending requests and authorization codes expire and all tokens die when th
   assert.throws(() => restarted.verify(tokens.access_token), error("invalid_token"));
 });
 
-test("access expiry can use refresh until the absolute development lease expires", () => {
+test("short access tokens expire while the same authorization refreshes after years", () => {
   const f = fixture();
   const { tokens } = f.grant();
   f.advance(10 * 60_000);
   assert.throws(() => f.gate.verify(tokens.access_token), error("invalid_token"));
   const renewed = f.gate.token(f.refresh(tokens));
   assert.equal(f.gate.verify(renewed.access_token).scope, "autodev");
-  f.advance(8 * 60 * 60_000);
+  f.advance(10 * 365 * 24 * 60 * 60_000);
   assert.throws(() => f.gate.verify(renewed.access_token), error("invalid_token"));
-  assert.throws(() => f.gate.token(f.refresh(renewed)), OAuthError);
+  assert.equal(f.gate.verify(f.gate.token(f.refresh(renewed)).access_token).client_id, f.client.client_id);
   const reauthorized = f.grant();
   assert.equal(f.gate.verify(reauthorized.tokens.access_token).client_id, f.client.client_id);
 });
@@ -243,7 +243,28 @@ test("invalid registration bursts and unlimited refresh rotations cannot grow me
   assert.doesNotThrow(() => f.gate.register(body()));
   const rotation = fixture();
   let { tokens } = rotation.grant();
-  for (let index = 0; index < 64; index++) tokens = rotation.gate.token(rotation.refresh(tokens));
-  assert.throws(() => rotation.gate.token(rotation.refresh(tokens)), error("invalid_grant"));
-  assert.throws(() => rotation.gate.verify(tokens.access_token), error("invalid_token"));
+  for (let index = 0; index < 8200; index++) {
+    rotation.advance(60_000);
+    tokens = rotation.gate.token(rotation.refresh(tokens));
+  }
+  assert.equal(rotation.gate.verify(rotation.gate.token(rotation.refresh(tokens)).access_token).client_id, rotation.client.client_id);
+});
+
+
+test('tampered refresh generations, signatures and clients cannot revoke a valid family', () => {
+  const f = fixture();
+  const { tokens: first } = f.grant();
+  const next = f.gate.token(f.refresh(first));
+  const other = f.gate.register(body());
+  const parts = first.refresh_token.split('.');
+  for (const [index, value] of [[1, 'a'.repeat(43)], [2, '1'], [2, '9007199254740992'], [2, '00'], [3, 'b'.repeat(43)], [4, 'c'.repeat(43)]] as const) {
+    const changed = [...parts]; changed[index] = value;
+    assert.throws(() => f.gate.token(f.refresh({ ...first, refresh_token: changed.join('.') })), error('invalid_grant'));
+    assert.doesNotThrow(() => f.gate.verify(next.access_token));
+  }
+  assert.throws(() => f.gate.token(f.refresh(first, { client_id: other.client_id })), error('invalid_grant'));
+  assert.throws(() => f.gate.token(f.refresh(next, { client_id: other.client_id })), error('invalid_grant'));
+  assert.doesNotThrow(() => f.gate.verify(next.access_token));
+  assert.throws(() => f.gate.token(f.refresh(first)), error('invalid_grant'));
+  assert.throws(() => f.gate.verify(next.access_token), error('invalid_token'));
 });

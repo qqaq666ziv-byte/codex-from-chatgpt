@@ -4,6 +4,11 @@ import path from 'node:path';
 export type ProcessIdentity = { created: string; command: string; executable: string };
 export type OwnedProcess = { pid: number; created: string; executable: string; entry: string; instance: string };
 
+export function processBirthMatches(recorded: string, current: string): boolean {
+  if (!Number.isFinite(Date.parse(recorded)) || !Number.isFinite(Date.parse(current))) throw new Error('Invalid process creation timestamp.');
+  return recorded === current;
+}
+
 export function processIdentity(pid: number): ProcessIdentity | null {
   if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error('Invalid process ID.');
   const script = "$ErrorActionPreference='Stop'; $p=Get-CimInstance Win32_Process -Filter ('ProcessId = '+$env:AUTODEV_INSPECT_PID); if($null -ne $p){$v=@{created=$p.CreationDate.ToUniversalTime().ToString('o');command=$p.CommandLine;executable=$p.ExecutablePath}|ConvertTo-Json -Compress;[Console]::Write([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($v)))}";

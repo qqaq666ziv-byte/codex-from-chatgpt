@@ -6,13 +6,13 @@
 
 ## 本機安裝
 
-需要已安裝的 Node.js **22 以上**（固定入口部署工具要求）、npm、Git 與官方 Codex CLI，以及 PowerShell。本次使用 Node 24.16.0，腳本在 Windows PowerShell 5.1 與 PowerShell 7 都做了行為測試。以下以 `pwsh.exe` 為例；可對已核對的單一腳本使用 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File ...`，不修改系統政策。本專案不修改防火牆、不建立開機常駐、不全域安裝工具，不繞過組織或 Windows Application Control。
+需要已安裝的 Node.js **22 以上**（固定入口部署工具要求）、npm、Git 與官方 Codex CLI，以及 PowerShell。2026-09-06 使用 Node 24.0.0、Codex CLI 0.153.4；腳本在 Windows PowerShell 5.1 與 PowerShell 7 做行為測試。以下以 `pwsh.exe` 為例；可對已核對的單一腳本使用 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File ...`，不修改系統政策。本專案不修改防火牆或全域安裝工具，不繞過組織或 Windows Application Control。可撤銷的目前使用者登入排程依 [AUTOSTART-WINDOWS.md](AUTOSTART-WINDOWS.md) 管理，不是關機或睡眠時仍可接單的系統服務。
 
 先使用官方登入介面，再安裝 lockfile 指定的專案依賴：
 
 ```powershell
-codex login status
-# 只有未登入時才執行：codex login
+codex.cmd login status
+# 只有未登入時才執行：codex.cmd login
 pwsh.exe -NoProfile -File .\scripts\autodev.ps1 setup
 pwsh.exe -NoProfile -File .\scripts\autodev.ps1 add-project -ProjectId demo -ProjectName '示範專案' -ProjectPath 'D:\Projects\demo'
 pwsh.exe -NoProfile -File .\scripts\autodev.ps1 start
@@ -35,7 +35,7 @@ pwsh.exe -NoProfile -File .\scripts\fixed-tunnel.ps1 start
 pwsh.exe -NoProfile -File .\scripts\fixed-tunnel.ps1 status
 ```
 
-status 分別核對 core、owned cloudflared、路由租約與外部 metadata。`ready_for_chatgpt_probe` 只表示可以開始 ChatGPT 探測，不能當成真正工具 E2E。用完可 `fixed-tunnel.ps1 stop` 再 `autodev.ps1 stop`。只重啟通道時使用 `fixed-tunnel.ps1 restart`，既有工作不必重送，App 不必重建。整機 reboot 後由使用者執行同一啟動入口；本輪不宣稱已做整機 reboot 驗收。
+日常狀態使用 `Status-AutoDev.cmd`，停止與重啟使用 `Stop-AutoDev.cmd`／`Restart-AutoDev.cmd`。status 分別核對 core、owned cloudflared、路由租約、外部 metadata 與本次 startup confirmation；`ready_for_chatgpt_probe` 只表示可以開始 ChatGPT 探測，不能當成真正工具 E2E。只重啟通道時使用 `fixed-tunnel.ps1 restart`，既有工作不必重送，App 不必重建。已啟用登入自啟時，登入後延遲 30 秒使用相同 Start 流程；真實重新登入／整機 reboot 仍須另驗，當日結果見 [交付報告](DELIVERY-2026-09-06.md)。
 
 ## Development fallback：原 Quick App
 

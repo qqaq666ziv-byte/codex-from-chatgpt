@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import path from "node:path";
 import test from "node:test";
@@ -67,8 +67,8 @@ const server = http.createServer((req, res) => {
   req.on('data', chunk => body += chunk);
   req.on('end', () => {
     res.setHeader('content-type', 'application/json');
-    if (req.url === '/admin/shutdown') { res.end('{}'); server.close(() => process.exit(0)); return; }
-    if (req.url === '/admin/status') { res.end(JSON.stringify({ ready: true, process_id: process.pid + (config.wrongIdentity ? 1 : 0), instance_id: instance, jobs: [] })); return; }
+    if (req.url === '/admin/shutdown') { if(fs.existsSync(path.join(runtime,'reject-shutdown'))){res.writeHead(409);res.end('{}');return;} res.end('{}'); server.close(() => process.exit(0)); return; }
+    if (req.url === '/admin/status') { const busy=fs.existsSync(path.join(runtime,'busy-state.json'))?JSON.parse(fs.readFileSync(path.join(runtime,'busy-state.json'),'utf8')):[]; res.end(JSON.stringify({ ready: true, process_id: process.pid + (config.wrongIdentity ? 1 : 0), instance_id: instance, active_job_id: null, tasks: busy })); return; }
     if (req.url === '/admin/approval' || req.url === '/admin/answer') {
       const message = { url: req.url, body: JSON.parse(body) };
       fs.writeFileSync(path.join(runtime, 'received.json'), JSON.stringify(message));
@@ -174,6 +174,18 @@ Assert-AutoDevExit 'Native arguments roundtrip' $Child.ExitCode
       assert.ok(existsSync(value.record));
       writeFileSync(value.record, originalRecord);
       assert.equal(JSON.parse((await value.run(shell, "status")).stdout).process_id, record.pid);
+      for (const state of ['running', 'recovery_required', 'dispatch_uncertain']) {
+        writeFileSync(path.join(value.runtime, 'busy-state.json'), JSON.stringify([{ execution_status: state }]));
+        const busy = await value.run(shell, 'stop');
+        assert.notEqual(busy.code, 0, busy.output);
+        assert.equal(JSON.parse((await value.run(shell, 'status')).stdout).process_id, record.pid);
+      }
+      writeFileSync(path.join(value.runtime, 'busy-state.json'), '[]');
+      writeFileSync(path.join(value.runtime, 'reject-shutdown'), 'synthetic race refusal');
+      const refused = await value.run(shell, 'stop');
+      assert.notEqual(refused.code, 0, refused.output);
+      assert.equal(JSON.parse((await value.run(shell, 'status')).stdout).process_id, record.pid);
+      unlinkSync(path.join(value.runtime, 'reject-shutdown'));
       const stopped = await value.run(shell, "stop");
       assert.equal(stopped.code, 0, stopped.output);
       assert.equal(existsSync(value.record), false);

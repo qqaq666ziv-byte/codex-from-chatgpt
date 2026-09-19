@@ -2,6 +2,8 @@
 
 讓一般 ChatGPT Chat 規劃與審查，由本機 Codex 修改程式、執行測試，並保留可逐頁查核的證據。
 
+2026-09-11 的[專案建立後開發循環](docs/DEVELOPMENT-LOOP.md)讓一般 ChatGPT 根據即時模型能力選擇 Codex model / effort，讀取完整版本證據並接續必要修正。[本輪真實驗收](docs/VALIDATION-2026-09-11.md)已完成兩輪 Codex、一般 ChatGPT 獨立審查與持久 PASS。下列固定入口歷史驗收為 2026-09-05，不與本輪混用。2026-09-06 的 Windows 日常入口與[登入自啟](docs/AUTOSTART-WINDOWS.md)功能仍保留，見[當日交付](docs/DELIVERY-2026-09-06.md)。
+
 目前版本 **0.4.2**：使用 **Cloudflare Workers Free 固定 HTTPS 入口**，保留同一 App URL 與 OAuth issuer，內部通道重啟不需要重建 ChatGPT App。加入加密 relay、Windows DPAPI 持久授權、一鍵啟動、私人備份與還原保護。實際帳號已核對 Free／$0，不購買網域、不新增付款方式、不自動升級或充值，免費配額耗盡停止。詳見 [固定入口與操作](docs/FIXED-ENTRY.md)、[成本政策](docs/COST-POLICY.md) 及 [本輪實測](docs/FIXED-ENTRY-VALIDATION.md)。
 
 OpenAI Secure MCP Tunnel 的用途費率及零超額費用機制仍未確認，因此保留受成本關卡保護的候選實作，未啟用 runtime key。API key、雲端及免費 credits 本身都不是排除條件。原 Quick App 保留為 development recovery；日常入口使用固定 App。`cc18c40` 的原 median 驗收與既有狀態完整保留。
@@ -13,7 +15,7 @@ OpenAI Secure MCP Tunnel 的用途費率及零超額費用機制仍未確認，�
 需要 Windows、Node.js **22+**（固定入口部署工具要求）、npm、Git、PowerShell 7，以及已透過官方 ChatGPT 登入的 Codex CLI。Windows 腳本亦在 PowerShell 5.1 驗證。從此儲存庫根目錄執行：
 
 ```powershell
-codex login status
+codex.cmd login status
 pwsh.exe -NoProfile -File .\scripts\autodev.ps1 setup
 pwsh.exe -NoProfile -File .\scripts\autodev.ps1 add-project -ProjectId demo -ProjectName '示範專案' -ProjectPath 'D:\Projects\demo'
 pwsh.exe -NoProfile -File .\scripts\autodev.ps1 start
@@ -41,6 +43,7 @@ ProjectPath 請換成你授權的既有 Git 儲存庫根目錄。預設使用可
 | MCP 工具 | 用途 |
 | --- | --- |
 | `autodev_projects` | 列出已註冊專案與模型設定 |
+| `autodev_create_project` | 在本機預先允許的根目錄建立並持久註冊空白 workspace；接著直接使用 submit，見 [建立新專案](docs/CREATE-PROJECT.md) |
 | `autodev_submit` | 提交有 request key 的需求與驗收條件 |
 | `autodev_status` | 查任務、執行及審查狀態 |
 | `autodev_evidence` / `autodev_artifact` | 取得 manifest 與全部證據分頁 |

@@ -1,5 +1,6 @@
-import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { validateOAuthState, type OAuthStateStore, type OAuthPersistentState } from "./oauth-state.js";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { validateOAuthState, type OAuthStateStore, type OAuthPersistentState, type OAuthStoredGrant, type OAuthStoredToken } from "./oauth-state.js";
+import { OAUTH_LEGACY_MAX_ROTATIONS as MAX_ROTATIONS, OAUTH_ACCESS_MS as ACCESS_MS, OAUTH_MAX_ACCESS_TOKENS } from './oauth-policy.js';
 
 export type OAuthErrorCode = "invalid_request" | "invalid_client_metadata" | "invalid_redirect_uri" | "invalid_client" | "unauthorized_client" | "invalid_scope" | "invalid_target" | "invalid_grant" | "unsupported_grant_type" | "invalid_token" | "access_denied" | "temporarily_unavailable";
 export class OAuthError extends Error {
@@ -18,14 +19,11 @@ type Consent = {
   id: string; verificationCode: string; clientId: string; clientName: string; redirect: string; state: string;
   challenge: string; expiresAt: number; status: "pending" | "approved" | "denied"; redirectUrl?: string; codeHash?: string;
 };
-type Grant = { id: string; clientId: string; expiresAt: number; rotations: number };
-type TokenRef = { grantId: string; expiresAt: number };
+type Grant = OAuthStoredGrant;
+type TokenRef = OAuthStoredToken;
 const PENDING_MS = 5 * 60_000;
 const CODE_MS = 60_000;
-const ACCESS_MS = 10 * 60_000;
-const GRANT_MS = 8 * 60 * 60_000;
 const CAPACITY = 32;
-const MAX_ROTATIONS = 64;
 const opaque = () => randomBytes(32).toString("base64url");
 const digest = (value: string) => createHash("sha256").update(value).digest("hex");
 const iso = (time: number) => new Date(time).toISOString();
@@ -72,8 +70,8 @@ function shortCode(): string {
  * issuer may explicitly opt into an encrypted, leased persistent state store.
  * The gateway MUST expose localApproval/pendingRequests only through its
  * authenticated local admin channel, never through public OAuth HTTP routes.
- * No OpenAI API key or hosted identity service is used. Persistence stores only
- * encrypted token hashes; pending requests and unredeemed codes remain volatile.
+ * No OpenAI API key or hosted identity service is used. Persistence encrypts
+ * token hashes and per-grant refresh signing keys; unredeemed codes stay volatile.
  * DCR public clients + PKCE follow the documented ChatGPT MCP auth contract:
  * https://developers.openai.com/plugins/build/auth
  * This deliberately does not advertise CIMD or accept arbitrary redirect URLs.
@@ -146,7 +144,7 @@ export class OAuthGate {
     const redirects = [...body.redirect_uris] as string[];
     // ChatGPT reuses DCR client_id for this connection, including reauthorization.
     // A configured fixed-issuer store preserves clients across process restarts;
-    // all token lifetimes and refresh limits retain their original bounds.
+    // legacy grants retain their original expiry and rotation bounds.
     this.clients.set(id, { id, name, redirects });
     this.persist(now);
     return { client_id: id, client_id_issued_at: Math.floor(now / 1000), client_name: name, redirect_uris: [...redirects], token_endpoint_auth_method: "none" as const, grant_types: ["authorization_code", "refresh_token"], response_types: ["code"] };
@@ -177,6 +175,21 @@ export class OAuthGate {
     return [...this.consents.values()].filter((consent) => consent.status === "pending").map((consent) => this.pendingView(consent));
   }
 
+  /** Authenticated local admin only. IDs are authorization handles, not tokens. */
+  authorizations() {
+    this.prepare();
+    return [...this.grants.values()].map(grant => ({ grant_id: grant.id, client_name: this.clients.get(grant.clientId)!.name,
+      scope: 'autodev' as const, expires_at: grant.expiresAt === null ? null : iso(grant.expiresAt) }));
+  }
+
+  revokeAuthorization(grantId: string) {
+    const now = this.prepare('revoke', 64);
+    if (typeof grantId !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(grantId)) failure('invalid_request', 'A local grant ID is required');
+    this.revoke(grantId);
+    this.persist(now);
+    return { revoked: true, grant_id: grantId };
+  }
+
   localApproval(requestId: string, approve: boolean, verificationCode: string) {
     const now = this.prepare("approval", 128);
     const consent = this.consent(requestId);
@@ -188,7 +201,7 @@ export class OAuthGate {
     redirect.searchParams.set("iss", this.issuer);
     if (approve) {
       const reserved = [...this.consents.values()].filter((entry) => entry.status === "approved").length;
-      if (this.grants.size + reserved >= CAPACITY) failure("temporarily_unavailable", "Development grant capacity reached; wait for grants to expire", 503);
+      if (this.grants.size + reserved >= CAPACITY) failure("temporarily_unavailable", "OAuth grant capacity reached; revoke unused local authorizations", 503);
       const code = opaque();
       consent.codeHash = digest(code);
       this.codes.set(consent.codeHash, consent.id);
@@ -223,7 +236,7 @@ export class OAuthGate {
     if (typeof token !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(token)) failure("invalid_token", "A valid gateway access token is required", 401);
     const ref = this.accessTokens.get(digest(token));
     const grant = ref ? this.grants.get(ref.grantId) : undefined;
-    if (!ref || !grant || ref.expiresAt <= now || grant.expiresAt <= now) failure("invalid_token", "Access token is invalid, expired or revoked", 401);
+    if (!ref || !grant || ref.expiresAt === null || ref.expiresAt <= now || (grant.expiresAt !== null && grant.expiresAt <= now)) failure("invalid_token", "Access token is invalid, expired or revoked", 401);
     return { grant_id: grant.id, client_id: grant.clientId, resource: this.resource, scope: "autodev", expires_at: iso(ref.expiresAt) };
   }
 
@@ -235,13 +248,14 @@ export class OAuthGate {
     if (!/^[A-Za-z0-9._~-]{43,128}$/.test(form.code_verifier!) || !/^[A-Za-z0-9_-]{43}$/.test(form.code!)) failure("invalid_grant", "Authorization code or PKCE verifier is invalid");
     const codeHash = digest(form.code!);
     const reused = this.usedCodes.get(codeHash);
-    if (reused) { this.revoke(reused.grantId); this.persist(now); failure("invalid_grant", "Authorization code has already been used; its grant was revoked"); }
+    if (reused && this.grants.get(reused.grantId)?.clientId === client.id) { this.revoke(reused.grantId); this.persist(now); failure("invalid_grant", "Authorization code has already been used; its grant was revoked"); }
     const requestId = this.codes.get(codeHash);
     const consent = requestId ? this.consents.get(requestId) : undefined;
     const challenge = createHash("sha256").update(form.code_verifier!).digest("base64url");
     if (!consent || consent.status !== "approved" || consent.expiresAt <= now || consent.clientId !== client.id || consent.redirect !== form.redirect_uri || !equal(consent.challenge, challenge)) failure("invalid_grant", "Authorization code is invalid, expired or bound to another request");
     if (this.grants.size >= CAPACITY) failure("temporarily_unavailable", "Development grant capacity reached", 503);
-    const grant: Grant = { id: opaque(), clientId: client.id, expiresAt: now + GRANT_MS, rotations: 0 };
+    this.checkAccessCapacity();
+    const grant: Grant = { id: opaque(), clientId: client.id, expiresAt: null, rotations: 0, refreshKey: opaque() };
     this.grants.set(grant.id, grant);
     this.codes.delete(codeHash);
     this.consents.delete(consent.id);
@@ -254,28 +268,59 @@ export class OAuthGate {
     const client = this.client(form.client_id!);
     if (form.resource !== this.resource) failure("invalid_target", "Resource must identify this gateway MCP endpoint exactly");
     if (form.scope !== undefined && form.scope !== "autodev") failure("invalid_scope", "Refresh cannot expand the authorized scope");
-    if (!/^[A-Za-z0-9_-]{43}$/.test(form.refresh_token!)) failure("invalid_grant", "Refresh token is invalid");
+    if (!/^[A-Za-z0-9_-]{43}$/.test(form.refresh_token!) && !/^r2\.[A-Za-z0-9_-]{43}\.(?:0|[1-9][0-9]{0,15})\.[A-Za-z0-9_-]{43}\.[A-Za-z0-9_-]{43}$/.test(form.refresh_token!)) failure("invalid_grant", "Refresh token is invalid");
     const tokenHash = digest(form.refresh_token!);
     const reused = this.usedRefresh.get(tokenHash);
-    if (reused) { this.revoke(reused.grantId); this.persist(now); failure("invalid_grant", "Refresh token replay detected; its grant was revoked"); }
+    if (reused && this.grants.get(reused.grantId)?.clientId === client.id) { this.revoke(reused.grantId); this.persist(now); failure("invalid_grant", "Refresh token replay detected; its grant was revoked"); }
+    const authenticated = this.authenticateRefresh(form.refresh_token!, client.id);
+    if (authenticated && authenticated.generation < authenticated.grant.rotations) {
+      this.revoke(authenticated.grant.id); this.persist(now);
+      failure('invalid_grant', 'Refresh token replay detected; its grant was revoked');
+    }
     const ref = this.refreshTokens.get(tokenHash);
     const grant = ref ? this.grants.get(ref.grantId) : undefined;
-    if (!ref || !grant || ref.expiresAt <= now || grant.clientId !== client.id) failure("invalid_grant", "Refresh token is invalid, expired or bound to another client");
-    if (grant.rotations >= MAX_ROTATIONS) { this.revoke(grant.id); this.persist(now); failure("invalid_grant", "Development refresh rotation limit reached; reconnect with local approval"); }
+    if (!ref || !grant || (ref.expiresAt !== null && ref.expiresAt <= now) || grant.clientId !== client.id ||
+        (grant.expiresAt === null && (!authenticated || authenticated.grant !== grant || authenticated.generation !== grant.rotations))) failure("invalid_grant", "Refresh token is invalid, expired or bound to another client");
+    if (grant.expiresAt !== null && grant.rotations >= MAX_ROTATIONS) { this.revoke(grant.id); this.persist(now); failure("invalid_grant", "Legacy refresh rotation limit reached; reconnect with local approval"); }
+    // This is an arithmetic overflow guard (over 100 billion years at one use
+    // every ten minutes), not a daily/monthly reconnection policy.
+    if (grant.rotations === Number.MAX_SAFE_INTEGER) failure('temporarily_unavailable', 'Refresh sequence exhausted; local recovery is required', 503);
+    this.checkAccessCapacity();
     this.refreshTokens.delete(tokenHash);
-    this.usedRefresh.set(tokenHash, ref);
+    if (grant.expiresAt !== null) this.usedRefresh.set(tokenHash, ref);
     grant.rotations++;
     return this.issue(grant, now);
   }
 
   private issue(grant: Grant, now: number): OAuthTokenResult {
     const access = opaque();
-    const refresh = opaque();
-    const expiresAt = Math.min(now + ACCESS_MS, grant.expiresAt);
+    const prefix = `r2.${grant.id}.${grant.rotations}.${opaque()}`;
+    const refresh = grant.expiresAt === null ? `${prefix}.${this.refreshMac(grant, prefix)}` : opaque();
+    const expiresAt = grant.expiresAt === null ? now + ACCESS_MS : Math.min(now + ACCESS_MS, grant.expiresAt);
     this.accessTokens.set(digest(access), { grantId: grant.id, expiresAt });
-    this.refreshTokens.set(digest(refresh), { grantId: grant.id, expiresAt: grant.expiresAt });
+    this.refreshTokens.set(digest(refresh), { grantId: grant.id, expiresAt: grant.expiresAt, ...(grant.expiresAt === null ? { generation: grant.rotations } : {}) });
     this.persist(now);
     return { access_token: access, token_type: "Bearer", expires_in: Math.floor((expiresAt - now) / 1000), refresh_token: refresh, scope: "autodev" };
+  }
+
+  private refreshMac(grant: Grant & { expiresAt: null }, prefix: string): string {
+    return createHmac('sha256', Buffer.from(grant.refreshKey, 'base64url'))
+      .update(JSON.stringify(['AutoDev refresh v2', this.issuer, this.resource, grant.clientId, 'autodev', prefix])).digest('base64url');
+  }
+
+  private authenticateRefresh(token: string, clientId: string) {
+    const parts = token.split('.');
+    if (parts.length !== 5 || parts[0] !== 'r2') return;
+    const grant = this.grants.get(parts[1]!);
+    const generation = Number(parts[2]);
+    if (!grant || grant.expiresAt !== null || grant.clientId !== clientId || !Number.isSafeInteger(generation) || generation < 0) return;
+    const prefix = parts.slice(0, 4).join('.');
+    if (!equal(parts[4]!, this.refreshMac(grant, prefix))) return;
+    return { grant, generation };
+  }
+
+  private checkAccessCapacity(): void {
+    if (this.accessTokens.size >= OAUTH_MAX_ACCESS_TOKENS) failure('temporarily_unavailable', 'Access token capacity reached; wait for short-lived tokens to expire', 503);
   }
 
   private revoke(grantId: string): void {
@@ -315,8 +360,8 @@ export class OAuthGate {
     const now = this.lastNow = Math.max(this.lastNow, current);
     const previousSize = this.durableSize();
     for (const [id, consent] of this.consents) if (consent.expiresAt <= now) { this.consents.delete(id); if (consent.codeHash) this.codes.delete(consent.codeHash); }
-    for (const [id, grant] of this.grants) if (grant.expiresAt <= now) this.revoke(id);
-    for (const index of [this.accessTokens, this.refreshTokens, this.usedRefresh, this.usedCodes]) for (const [key, ref] of index) if (ref.expiresAt <= now) index.delete(key);
+    for (const [id, grant] of this.grants) if (grant.expiresAt !== null && grant.expiresAt <= now) this.revoke(id);
+    for (const index of [this.accessTokens, this.refreshTokens, this.usedRefresh, this.usedCodes]) for (const [key, ref] of index) if (ref.expiresAt !== null && ref.expiresAt <= now) index.delete(key);
     if (this.durableSize() !== previousSize) this.persist(now);
     if (rate) {
       let bucket = this.rates.get(rate);
@@ -330,7 +375,7 @@ export class OAuthGate {
 
   private persist(now: number): void {
     if (!this.stateStore) return;
-    const state: OAuthPersistentState = { schemaVersion: 1, issuer: this.issuer, writtenAt: now, clients: [...this.clients.values()], grants: [...this.grants.values()],
+    const state: OAuthPersistentState = { schemaVersion: 2, issuer: this.issuer, writtenAt: now, clients: [...this.clients.values()], grants: [...this.grants.values()],
       accessTokens: [...this.accessTokens], refreshTokens: [...this.refreshTokens], usedRefresh: [...this.usedRefresh], usedCodes: [...this.usedCodes] };
     try { this.stateStore.save(state); }
     catch {

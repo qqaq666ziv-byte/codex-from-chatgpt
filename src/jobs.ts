@@ -10,6 +10,7 @@ import type { TurnStartParams } from "../protocol/codex-0.147.0-ts/v2/TurnStartP
 import { AppServerError, type AppServerClient, type AppServerMessage, type JsonObject, type JsonRpcId } from "./codex-app-server.js";
 import { StateStore, type PersistedJob, type PersistedValidation } from "./store.js";
 import { validateWorkspace } from "./workspaces.js";
+import { classifyRoutingError, makeRoutingEvidence, type RoutingDecision, type RoutingEvidence } from './model-routing.js';
 
 export type JobStatus =
   | "starting"
@@ -63,6 +64,7 @@ type JobRecord = {
   updatedAt: string;
   effectiveConfig: Record<string, unknown>;
   evidenceItems: JsonObject[];
+  routing?: RoutingEvidence;
 };
 
 export type JobDetail = "compact" | "standard" | "debug";
@@ -117,6 +119,7 @@ export type PendingApprovalView = {
 };
 
 export type JobSnapshot = {
+  routing?: RoutingEvidence;
   status: JobStatus;
   revision: number;
   unchanged?: true;
@@ -155,7 +158,17 @@ export type JobManagerOptions = {
   store?: StateStore;
   model?: string;
   reasoningEffort?: string;
+  settingsConfirmationTimeoutMs?:number;
 };
+
+/** No turn/start was sent; future thread settings may still require reconciliation. */
+export class RoutingPreparationError extends AppServerError {
+  constructor(error:unknown){
+    const unavailable=error instanceof AppServerError&&error.code===-32601;
+    super(unavailable?'Routing blocked: thread/settings/update is unsupported; no turn started.':'Routing blocked: thread settings were not confirmed; no turn started.',error instanceof AppServerError?error.code:null,error instanceof AppServerError?error.data:null);
+    this.name='RoutingPreparationError';
+  }
+}
 
 export const COMPLETION_REPORT_MARKER = "[codex-from-chatgpt internal completion handoff]";
 
@@ -405,7 +418,7 @@ function isActiveStatus(status: JobStatus): boolean {
 }
 
 function isAmbiguousThreadStartError(error: unknown): boolean {
-  return isObject(error) && error.code === -32002;
+  return !(error instanceof AppServerError) || error.code === -32002 || error.code === null;
 }
 
 function messageTurnId(message: AppServerMessage): string | null {
@@ -473,6 +486,7 @@ export class JobManager {
   private readonly store: StateStore;
   private readonly model: string | undefined;
   private readonly reasoningEffort: string | undefined;
+  private readonly settingsConfirmationTimeoutMs:number;
   private activeJobId: string | null = null;
   private recoveryFence = false;
   private rehydrated = false;
@@ -483,6 +497,7 @@ export class JobManager {
     this.store = options.store ?? new StateStore();
     this.model = options.model ?? (process.env.CODEX_AGENT_MODEL?.trim() || undefined);
     this.reasoningEffort = options.reasoningEffort ?? (process.env.CODEX_AGENT_REASONING_EFFORT?.trim() || undefined);
+    this.settingsConfirmationTimeoutMs=options.settingsConfirmationTimeoutMs??10000;
     this.loadPersistedIndex();
     appServer.addMessageListener((message) => this.handleAppServerMessage(message));
     appServer.addExitListener((error) => this.handleAppServerExit(error));
@@ -494,7 +509,8 @@ export class JobManager {
     });
   }
 
-  async start(workspace: string, prompt: string, requestedJobId?: string): Promise<JobStartResult> {
+  async start(workspace: string, prompt: string, requestedJobId?: string, routing?: RoutingDecision): Promise<JobStartResult> {
+    const selected=this.executionSelection(routing);
     const canonicalWorkspace = await this.workspaceValidator(workspace);
     this.validatePrompt(prompt);
     return this.withExclusive(async () => {
@@ -509,14 +525,15 @@ export class JobManager {
         revisionFingerprint: "", updatedAt: new Date().toISOString(),
         effectiveConfig: {}, evidenceItems: [],
       };
+      if(routing)job.routing=makeRoutingEvidence(routing,job.jobId,null,'thread/start',{});
       this.touch(job);
       this.jobs.set(job.jobId, job);
       this.activeJobId = job.jobId;
       try {
         if (!this.persist(job, true)) throw new Error("No se pudo persistir el job antes de crear el thread.");
         const response = await this.appServer.request<unknown>("thread/start", {
-          ...(this.model ? { model: this.model } : {}),
-          ...(this.reasoningEffort ? { config: { model_reasoning_effort: this.reasoningEffort } } : {}),
+          ...(selected.model ? { model: selected.model } : {}),
+          ...(selected.effort ? { config: { model_reasoning_effort: selected.effort } } : {}),
           cwd: canonicalWorkspace,
           approvalPolicy: "on-request",
           approvalsReviewer: "user",
@@ -527,13 +544,15 @@ export class JobManager {
         this.attachThread(job, threadId);
         if (isObject(response)) {
           job.effectiveConfig = { model: response.model ?? null, reasoningEffort: response.reasoningEffort ?? null, approvalPolicy: response.approvalPolicy ?? null, sandbox: response.sandbox ?? null };
-          if ((this.model && response.model !== this.model) || (this.reasoningEffort && response.reasoningEffort !== this.reasoningEffort)) {
+          if(routing)job.routing=makeRoutingEvidence(routing,job.jobId,threadId,'thread/start',response);
+          if ((selected.model && response.model !== selected.model) || (selected.effort && response.reasoningEffort !== selected.effort)) {
             throw new Error("Effective model/effort differs from requested configuration; execution was not started.");
           }
         }
         this.persist(job, true);
-        await this.startTurn(job, prompt);
+        await this.startTurn(job, prompt,selected);
       } catch (error) {
+        if(job.routing)job.routing.dispatch_error_kind=classifyRoutingError(error);
         if (job.threadId === null && isAmbiguousThreadStartError(error)) {
           this.setRecoveryRequired(job, new Error(`thread/start incierto: el resultado puede haber creado un thread, pero no se adopta automáticamente (${error instanceof Error ? error.message : String(error)}).`));
         } else if (job.status !== "recovery_required") {
@@ -547,7 +566,8 @@ export class JobManager {
     });
   }
 
-  async continue(jobId: string, prompt: string): Promise<JobStartResult> {
+  async continue(jobId: string, prompt: string, routing?: RoutingDecision): Promise<JobStartResult> {
+    const selected=this.executionSelection(routing);
     this.validatePrompt(prompt);
     return this.withExclusive(async () => {
       await this.ensureReady();
@@ -561,21 +581,38 @@ export class JobManager {
       }
       if (job.threadId === null) throw new Error("el job aún no tiene un thread confirmado; requiere reconciliación.");
       this.activeJobId = job.jobId;
+      let newTurnStarted=false;
       try {
         await this.workspaceValidator(job.workspace);
-        const resumed = await this.appServer.request<unknown>("thread/resume", {
+        let resumed = await this.appServer.request<unknown>("thread/resume", {
           threadId: job.threadId, cwd: job.workspace,
-          ...(this.model ? {model:this.model} : {}),
-          ...(this.reasoningEffort ? {config:{model_reasoning_effort:this.reasoningEffort}} : {}),
+          ...(selected.model ? {model:selected.model} : {}),
+          ...(selected.effort ? {config:{model_reasoning_effort:selected.effort}} : {}),
           approvalPolicy:"on-request", approvalsReviewer:"user", sandbox:"workspace-write",
         });
         if (!isObject(resumed) || !isObject(resumed.thread) || resumed.thread.id !== job.threadId) throw new Error("thread/resume did not confirm the same thread.");
-        if ((this.model && resumed.model !== this.model) || (this.reasoningEffort && resumed.reasoningEffort !== this.reasoningEffort)) throw new Error("Resumed model/effort differs from configured execution; turn not started.");
-        job.effectiveConfig={model:resumed.model??null,reasoningEffort:resumed.reasoningEffort??null,approvalPolicy:resumed.approvalPolicy??null,sandbox:resumed.sandbox??null};
         if (Array.isArray(resumed.thread.turns) && resumed.thread.turns.some(turn => isObject(turn) && turn.status === "inProgress")) throw new Error("Resumed thread has an unresolved active turn.");
-        await this.startTurn(job, prompt);
+        if(routing)this.assertIdleRoutingResume(job,resumed);
+        if(routing&&((selected.model&&resumed.model!==selected.model)||(selected.effort&&resumed.reasoningEffort!==selected.effort))){
+          try {
+            // 0.153.4 rejoins loaded/subscribed threads without applying resume
+            // overrides. Update future settings, wait for publication, then read back.
+            await this.updateIdleThreadSettings(job.threadId,selected);
+            resumed=await this.appServer.request<unknown>('thread/resume',{threadId:job.threadId,cwd:job.workspace});
+            if(!isObject(resumed)||!isObject(resumed.thread)||resumed.thread.id!==job.threadId||
+              !Array.isArray(resumed.thread.turns)||resumed.thread.turns.some(turn=>isObject(turn)&&turn.status==='inProgress')||
+              resumed.model!==selected.model||resumed.reasoningEffort!==selected.effort)throw new Error('Updated thread settings did not read back as requested on the same idle thread.');
+            this.assertIdleRoutingResume(job,resumed);
+          } catch(error){throw new RoutingPreparationError(error);}
+        }
+        if(!isObject(resumed)||!isObject(resumed.thread))throw new Error('Missing resumed thread configuration.');
+        if ((selected.model && resumed.model !== selected.model) || (selected.effort && resumed.reasoningEffort !== selected.effort)) throw new Error("Resumed model/effort differs from configured execution; turn not started.");
+        const effectiveConfig={model:resumed.model??null,reasoningEffort:resumed.reasoningEffort??null,approvalPolicy:resumed.approvalPolicy??null,sandbox:resumed.sandbox??null};
+        if (Array.isArray(resumed.thread.turns) && resumed.thread.turns.some(turn => isObject(turn) && turn.status === "inProgress")) throw new Error("Resumed thread has an unresolved active turn.");
+        newTurnStarted=true;
+        await this.startTurn(job,prompt,selected,{effectiveConfig,routing:routing?makeRoutingEvidence(routing,job.jobId,job.threadId,'thread/resume',resumed):undefined});
       } catch (error) {
-        this.setFailure(job, error, true);
+        this.setFailure(job, error, true,newTurnStarted);
         throw error;
       }
       return this.startResult(job);
@@ -659,7 +696,8 @@ export class JobManager {
     return structuredClone({ job_id: job.jobId, thread_id: job.threadId, turn_id: job.turnId,
       revision: job.revision, status: job.status, final_message: job.finalMessage,
       latest_diff: job.latestDiff, files_changed: job.filesChanged, validation: job.validation,
-      effective_config: job.effectiveConfig, items: job.evidenceItems });
+      effective_config: job.effectiveConfig, items: job.evidenceItems,
+      ...(job.routing?{routing:job.routing}:{}) });
   }
 
   async respondUserInput(jobId: string, requestId: JsonRpcId, answers: Record<string, { answers: string[] }>): Promise<JobSnapshot> {
@@ -738,20 +776,21 @@ export class JobManager {
       const latest = exactLatestTurn(thread, "thread/read");
       const latestStatus = latest.status;
       if (latestStatus === "inProgress") {
+        const selected=this.executionSelection(job.routing?.decision);
         if (!mayResume || this.activeJobId !== null && this.activeJobId !== job.jobId) {
           this.setRecoveryRequired(job, new Error("hay más de un turn activo persistido; la política V0.2 permite uno por proceso."));
           return;
         }
         const resumed = await this.appServer.request<unknown>("thread/resume", {
           threadId: expectedThreadId, cwd: job.workspace,
-          ...(this.model ? { model: this.model } : {}),
-          ...(this.reasoningEffort ? { config: { model_reasoning_effort: this.reasoningEffort } } : {}),
+          ...(selected.model ? { model: selected.model } : {}),
+          ...(selected.effort ? { config: { model_reasoning_effort: selected.effort } } : {}),
           approvalPolicy: "on-request", approvalsReviewer: "user", sandbox: "workspace-write",
         });
         const resumedThread = isObject(resumed) && isObject(resumed.thread) ? resumed.thread : null;
         if (!resumedThread) throw new Error("thread/resume did not return the saved thread.");
         const resumedTurn = exactLatestTurn(resumedThread, "thread/resume");
-        if (!isObject(resumed) || (this.model && resumed.model !== this.model) || (this.reasoningEffort && resumed.reasoningEffort !== this.reasoningEffort)) {
+        if (!isObject(resumed) || (selected.model && resumed.model !== selected.model) || (selected.effort && resumed.reasoningEffort !== selected.effort)) {
           throw new Error("Resumed model/effort differs from configured recovery; turn remains blocked.");
         }
         job.effectiveConfig = { model: resumed.model ?? null, reasoningEffort: resumed.reasoningEffort ?? null, approvalPolicy: resumed.approvalPolicy ?? null, sandbox: resumed.sandbox ?? null };
@@ -794,6 +833,7 @@ export class JobManager {
       completionReportInjected: value.completion_report_injected ?? false,
       revisionFingerprint: "", updatedAt: value.updated_at,
       effectiveConfig: value.effective_config ?? {}, evidenceItems: value.evidence_items ?? [],
+      ...(value.routing?{routing:structuredClone(value.routing)}:{}),
     };
     job.revisionFingerprint = this.observableState(job);
     return job;
@@ -817,9 +857,38 @@ export class JobManager {
     this.touch(job);
   }
 
-  private async startTurn(job: JobRecord, prompt: string): Promise<void> {
+  private executionSelection(routing?:RoutingDecision):{model?:string;effort?:string}{
+    if(routing){if(routing.status!=='selected'||!routing.selected_model||!routing.selected_effort)throw new Error('Routing is blocked; no dispatch permitted.');return {model:routing.selected_model,effort:routing.selected_effort};}
+    return {model:this.model,effort:this.reasoningEffort};
+  }
+
+  private async updateIdleThreadSettings(threadId:string,selected:{model?:string;effort?:string}):Promise<void>{
+    let timer:NodeJS.Timeout|undefined;
+    let remove=()=>{};
+    const confirmed=new Promise<void>((resolve,reject)=>{
+      remove=this.appServer.addMessageListener(message=>{
+        const params=isObject(message.params)?message.params:null;
+        const settings=params&&isObject(params.threadSettings)?params.threadSettings:null;
+        if(message.method==='thread/settings/updated'&&params?.threadId===threadId&&settings?.model===selected.model&&settings?.effort===selected.effort)resolve();
+      });
+      timer=setTimeout(()=>reject(new AppServerError('Thread settings confirmation timed out.',-32002)),this.settingsConfirmationTimeoutMs);
+    });
+    try {await Promise.all([confirmed,this.appServer.request('thread/settings/update',{threadId,model:selected.model,effort:selected.effort})]);}
+    finally {if(timer)clearTimeout(timer);remove();}
+  }
+
+  private assertIdleRoutingResume(job:JobRecord,response:JsonObject):void {
+    const thread=isObject(response.thread)?response.thread:null;
+    const turns=thread&&Array.isArray(thread.turns)?thread.turns:null;
+    const latest=turns?.at(-1);
+    if(!thread||thread.id!==job.threadId||!turns||!isObject(latest)||latest.id!==job.turnId||!isTerminal(latest.status)||
+      turns.filter(t=>isObject(t)&&t.id===job.turnId).length!==1||turns.some(t=>isObject(t)&&t.status==='inProgress'))throw new RoutingPreparationError(new Error('The saved terminal turn was not confirmed as the latest idle turn.'));
+  }
+
+  private async startTurn(job: JobRecord, prompt: string, selected=this.executionSelection(), next?:{effectiveConfig:Record<string,unknown>;routing?:RoutingEvidence}): Promise<void> {
     if (job.threadId === null) throw new Error("no hay thread confirmado para iniciar el turn.");
     this.resetTurn(job);
+    if(next){job.effectiveConfig=next.effectiveConfig;if(next.routing)job.routing=next.routing;else delete job.routing;}
     this.persist(job, true);
     const turnPrompt = this.promptForTurn(job, prompt);
     const capture: TurnCapture = { jobId: job.jobId, threadId: job.threadId, turnId: null, buffered: [] };
@@ -827,8 +896,8 @@ export class JobManager {
     const params: TurnStartParams = {
       threadId: job.threadId,
       input: [{ type: "text", text: turnPrompt, text_elements: [] }],
-      ...(this.model ? { model: this.model } : {}),
-      ...(this.reasoningEffort ? { effort: this.reasoningEffort as TurnStartParams["effort"] } : {}),
+      ...(selected.model ? { model: selected.model } : {}),
+      ...(selected.effort ? { effort: selected.effort as TurnStartParams["effort"] } : {}),
     };
     try {
       const response = await this.appServer.request<unknown>("turn/start", params);
@@ -836,6 +905,7 @@ export class JobManager {
       const turnId = requiredString(turn?.id, "turn.id");
       capture.turnId = turnId;
       job.turnId = turnId;
+      if(job.routing)job.routing.turn_id=turnId;
       for (const message of capture.buffered) {
         const legacyApproval = message.method === "applyPatchApproval" || message.method === "execCommandApproval";
         if (legacyApproval || messageTurnId(message) === turnId) this.handleAppServerMessage(message);
@@ -849,6 +919,10 @@ export class JobManager {
       }
       this.touch(job);
       this.persist(job, true);
+    } catch(error){
+      if(job.routing)job.routing.dispatch_error_kind=classifyRoutingError(error);
+      if(isAmbiguousThreadStartError(error))this.setRecoveryRequired(job,error instanceof Error?error:new Error('Unconfirmed turn dispatch.'));
+      throw error;
     } finally {
       this.turnCaptures.delete(job.threadId);
     }
@@ -921,6 +995,7 @@ export class JobManager {
       case "item/started":
       case "item/completed": this.handleItem(job, params); break;
       case "error":
+        if(job.routing)job.routing.dispatch_error_kind=classifyRoutingError(params.error??params);
         job.error = formatProtocolError(params.error ?? params.message);
         if (messageTurnId(message) === job.turnId) this.setRecoveryRequired(job, new Error(job.error));
         else this.persist(job);
@@ -988,6 +1063,7 @@ export class JobManager {
   }
 
   private applyTerminalStatus(job: JobRecord, status: "completed" | "interrupted" | "failed", turn: JsonObject): void {
+    if(status==='failed'&&job.routing)job.routing.dispatch_error_kind=classifyRoutingError(turn.error);
     this.recordTurnItems(job, turn);
     if (status === "completed") {
       job.status = "completed"; job.finalMessage = this.finalMessage(job); job.pendingApprovals.clear(); job.activity = null; this.activeJobId = this.activeJobId === job.jobId ? null : this.activeJobId;
@@ -1063,7 +1139,8 @@ export class JobManager {
     }
   }
 
-  private setFailure(job: JobRecord, error: unknown, uncertain: boolean): void {
+  private setFailure(job: JobRecord, error: unknown, uncertain: boolean,recordRoutingError=true): void {
+    if(job.routing&&recordRoutingError)job.routing.dispatch_error_kind=classifyRoutingError(error);
     if (uncertain || error instanceof AppServerError && error.code === -32002) this.setRecoveryRequired(job, error);
     else { job.status = "failed"; job.error = error instanceof Error ? error.message : String(error); job.activity = null; this.activeJobId = this.activeJobId === job.jobId ? null : this.activeJobId; this.touch(job); this.persist(job); }
   }
@@ -1089,6 +1166,7 @@ export class JobManager {
       activity: job.activity,
       validation: job.validation,
       warnings: job.warnings,
+      ...(job.routing?{routing:job.routing}:{}),
       approvals: [...job.pendingApprovals.values()].map((approval) => ({
         requestId: approval.requestId,
         kind: approval.kind,
@@ -1116,6 +1194,7 @@ export class JobManager {
       final_message: job.finalMessage, latest_diff: job.latestDiff, files_changed: [...job.filesChanged], commands_executed: [...job.commandsExecuted], error: job.error, updated_at: job.updatedAt,
       revision: job.revision,
       effective_config: job.effectiveConfig, evidence_items: job.evidenceItems,
+      ...(job.routing?{routing:job.routing}:{}),
       validation: job.validation.map((entry): PersistedValidation => ({
         kind: entry.kind, command: entry.command, status: entry.status,
         ...(entry.exit_code === undefined ? {} : { exit_code: entry.exit_code }),
@@ -1177,6 +1256,7 @@ export class JobManager {
 
   private identitySnapshot(job: JobRecord): JobSnapshot {
     const result: JobSnapshot = { status: job.status, revision: job.revision, job_id: job.jobId };
+    if(job.routing)result.routing=structuredClone(job.routing);
     if (job.threadId) result.thread_id = job.threadId;
     if (job.turnId) result.turn_id = job.turnId;
     return result;

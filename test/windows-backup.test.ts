@@ -154,6 +154,55 @@ $Wrong = @(Get-ChildItem -LiteralPath ${quote(path.join(value.root, ".backups", 
     assert.notEqual((await value.run(shell, "verify-backup", "../outside")).code, 0);
   });
 
+  test(`${shell}: backup and update prune excluded cache and lease trees while verified snapshots still reject links`, { skip: process.platform !== "win32", timeout: 180_000 }, async context => {
+    if (shell === "pwsh.exe" && (await command(shell, "$PSVersionTable.PSVersion.ToString()")).code !== 0) { context.skip("PowerShell 7 is unavailable"); return; }
+    const value = await fixture();
+    const excluded = ["cloudflare-cli", "logs", "gateway-lease", "secure-tunnel-lease", "fixed-gateway-lease", "cache.tmp"];
+    const target = path.join(value.root, "excluded-junction-target");
+    mkdirSync(target);
+    writeFileSync(path.join(target, "outside-artifact.txt"), "synthetic-excluded-cache-content");
+    const junctions = excluded.map(name => {
+      const directory = path.join(value.runtime, name, "nested-cache");
+      mkdirSync(directory, { recursive: true });
+      writeFileSync(path.join(directory, "volatile.txt"), "synthetic-volatile-cache-content");
+      return path.join(directory, "cache-junction");
+    });
+    const linked = await command(shell, junctions.map(link => `New-Item -ItemType Junction -Path ${quote(link)} -Target ${quote(target)} | Out-Null`).join("\n"));
+    assert.equal(linked.code, 0, linked.output);
+
+    const saved = await value.run(shell, "backup");
+    assert.equal(saved.code, 0, saved.output);
+    assert.equal(saved.output.includes(token), false);
+    const id = backupId(saved.output);
+    const location = path.join(value.root, ".backups", id);
+    const manifest = JSON.parse(readFileSync(path.join(location, "manifest.json"), "utf8"));
+    assert.ok(manifest.files.some((file: { path: string; sha256: string }) => file.path === "evidence/fixture/artifact.txt" && file.sha256 === hash("synthetic-evidence")));
+    assert.ok(manifest.files.some((file: { path: string }) => file.path === "fixed-oauth.dpapi"));
+    assert.equal(manifest.files.some((file: { path: string }) => excluded.some(name => file.path.startsWith(name + "/")) || file.path.includes("outside-artifact")), false);
+    for (const name of excluded) assert.equal(existsSync(path.join(location, "runtime", name)), false);
+    assert.equal((await value.run(shell, "verify-backup", id)).code, 0);
+    const updated = await value.run(shell, "update");
+    assert.equal(updated.code, 0, updated.output);
+    assert.match(updated.output, /built and verified/);
+    assert.equal(readFileSync(value.npmLog, "utf8").trim().split(/\r?\n/).join("|"), "ci --ignore-scripts --no-audit --no-fund|run typecheck|test|run build");
+
+    // Exclusions apply only to source snapshots; a selected backup must be fully
+    // physical, even if a malicious extra member uses an excluded cache name.
+    const backupCache = path.join(location, "runtime", "cloudflare-cli");
+    mkdirSync(backupCache);
+    const poisoned = await command(shell, `New-Item -ItemType Junction -Path ${quote(path.join(backupCache, "cache-junction"))} -Target ${quote(target)} | Out-Null`);
+    assert.equal(poisoned.code, 0, poisoned.output);
+    const rejectedBackup = await value.run(shell, "verify-backup", id);
+    assert.notEqual(rejectedBackup.code, 0, rejectedBackup.output);
+    assert.match(rejectedBackup.output, /linked files or directories/);
+    const durableLink = await command(shell, `New-Item -ItemType Junction -Path ${quote(path.join(value.runtime, "evidence", "linked-evidence"))} -Target ${quote(target)} | Out-Null`);
+    assert.equal(durableLink.code, 0, durableLink.output);
+    const rejectedSource = await value.run(shell, "backup");
+    assert.notEqual(rejectedSource.code, 0, rejectedSource.output);
+    assert.match(rejectedSource.output, /linked files or directories/);
+    assert.equal(readFileSync(path.join(target, "outside-artifact.txt"), "utf8"), "synthetic-excluded-cache-content");
+  });
+
   test(`${shell}: update backs up before a build failure; unsupported or active state prevents any build`, { skip: process.platform !== "win32", timeout: 180_000 }, async context => {
     if (shell === "pwsh.exe" && (await command(shell, "$PSVersionTable.PSVersion.ToString()")).code !== 0) { context.skip("PowerShell 7 is unavailable"); return; }
     const value = await fixture();

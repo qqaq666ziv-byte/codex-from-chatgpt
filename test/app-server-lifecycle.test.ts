@@ -2,8 +2,46 @@ import assert from "node:assert/strict";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import path from "node:path";
 import test from "node:test";
+import { EventEmitter } from 'node:events';
+import { PassThrough, Writable } from 'node:stream';
+import { setImmediate as yieldLoop } from 'node:timers/promises';
 
 import { CodexAppServer } from "../src/codex-app-server.js";
+
+for (const exitedBeforeClose of [false, true]) test(`unconfirmed shutdown rejects and cannot replace ${exitedBeforeClose ? 'an exited root with open pipes' : 'the live owner'}`, async context => {
+  context.mock.timers.enable({ apis: ['setTimeout'] });
+  const child = new EventEmitter() as ChildProcessWithoutNullStreams;
+  const stdout = new PassThrough(), stderr = new PassThrough();
+  let first = true, spawned = 0, kills = 0;
+  Object.assign(child, { stdout, stderr, exitCode:null, signalCode:null, killed:false,
+    kill: () => { kills++; return false; },
+    stdin: new Writable({ write(chunk, _encoding, done) {
+      const line=String(chunk).trim();
+      if (first && process.platform === 'win32') { first=false; queueMicrotask(()=>stdout.write('AUTODEV_CODEX_READY\n')); done(); return; }
+      const message=JSON.parse(line);
+      if (message.id!==undefined) queueMicrotask(()=>stdout.write(JSON.stringify({id:message.id,result:{}})+'\n'));
+      done();
+    }}),
+  });
+  const client=new CodexAppServer({command:process.execPath,shutdownTimeoutMs:20,killTimeoutMs:20,
+    spawnProcess:(()=>{spawned++;return child;}) as typeof spawn});
+  await client.start();
+  if (exitedBeforeClose) Object.assign(child,{exitCode:0});
+  const stop=assert.rejects(client.stop(),/shutdown was not confirmed/);
+  await yieldLoop(); context.mock.timers.tick(20000);
+  await yieldLoop(); context.mock.timers.tick(100);
+  await yieldLoop(); context.mock.timers.tick(100);
+  await stop;
+  assert.equal(client.isReady(),false);
+  if (!exitedBeforeClose) assert.ok(kills>0);
+  const restart=assert.rejects(client.start(),/shutdown was not confirmed/);
+  await yieldLoop(); context.mock.timers.tick(20000);
+  await yieldLoop(); context.mock.timers.tick(100);
+  await yieldLoop(); context.mock.timers.tick(100);
+  await restart;
+  assert.equal(spawned,1);
+  stdout.end();stderr.end();
+});
 
 function fixtureClient() {
   return new CodexAppServer({

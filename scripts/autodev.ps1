@@ -25,7 +25,7 @@ $RecordPath = Join-Path $Runtime 'server-process.json'
 $ExplicitPortRequested = $PSBoundParameters.ContainsKey('Port')
 
 function Assert-AutoDevStoppedForBuild {
-  if (Test-Path -LiteralPath $Runtime) { Assert-AutoDevPhysicalTree $Runtime }
+  if (Test-Path -LiteralPath $Runtime) { Assert-AutoDevPhysicalTree $Runtime -SkipBackupExcluded }
   foreach ($Name in @('server-process.json', 'gateway.json', 'secure-tunnel-process.json', 'fixed-gateway-process.json')) {
     $Record = Read-AutoDevProcessRecord (Join-Path $Runtime $Name)
     if ($Record -and (Get-AutoDevProcessInfo ([int]$Record.pid))) {
@@ -49,7 +49,7 @@ function Invoke-AutoDevMaintenance([scriptblock]$Operation) {
   $Leases = @()
   try {
     if (Test-Path -LiteralPath $Runtime -PathType Container) {
-      Assert-AutoDevPhysicalTree $Runtime
+      Assert-AutoDevPhysicalTree $Runtime -SkipBackupExcluded
       $Leases += Enter-AutoDevOfflineLease $Runtime
       foreach ($Name in @('gateway-lease', 'secure-tunnel-lease', 'fixed-gateway-lease')) {
         $LeaseDirectory = Join-Path $Runtime $Name
@@ -92,7 +92,7 @@ function Start-AutoDev {
   Protect-AutoDevRuntime $Runtime
   $Existing = Read-AutoDevProcessRecord $RecordPath
   if ($Existing) {
-    $Info = Get-AutoDevProcessInfo ([int]$Existing.pid)
+    $Info = Get-AutoDevRecordedProcess $Existing
     if ($Info) {
       if (-not (Test-AutoDevOwnedProcess $Existing $Info $Root)) { throw 'Existing process record does not match the process; no process was changed.' }
       $Status = Invoke-AutoDevAdmin $Config $Runtime '/admin/status'
@@ -105,14 +105,17 @@ function Start-AutoDev {
   if (-not (Test-AutoDevPortFree ([int]$Config.port))) { throw "Port $($Config.port) is occupied. No listener was stopped. Stop the owner or choose a free port in the local configuration." }
   $Entry = Join-Path $Root 'dist\src\index.js'
   if (-not (Test-Path -LiteralPath $Entry -PathType Leaf)) { throw 'Built server is missing; run setup.' }
-  $Node = (Get-Command node.exe -ErrorAction Stop).Source
+  $Node = Resolve-AutoDevNode
+  $Codex = Resolve-AutoDevCodex
   $Instance = [Guid]::NewGuid().ToString('N')
   $Arguments = (@($Entry, "--autodev-instance=$Instance") | ForEach-Object { ConvertTo-AutoDevNativeArgument $_ }) -join ' '
   $PreviousConfig = $env:AUTODEV_CONFIG
+  $PreviousCodex = $env:AUTODEV_CODEX_EXECUTABLE
   $Process = $null
   $Record = $null
   try {
     $env:AUTODEV_CONFIG = $ConfigPath
+    $env:AUTODEV_CODEX_EXECUTABLE = $Codex
     $Process = Start-Process -FilePath $Node -ArgumentList $Arguments -WorkingDirectory $Root -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $Runtime "server-$Instance.stdout.log") -RedirectStandardError (Join-Path $Runtime "server-$Instance.stderr.log")
     $Process.Refresh()
     if ($Process.HasExited) { throw "AutoDev exited during startup (exit $($Process.ExitCode))." }
@@ -141,23 +144,32 @@ function Start-AutoDev {
       if (Test-Path -LiteralPath $RecordPath) { Remove-Item -LiteralPath $RecordPath -Force }
     }
     throw $Failure
-  } finally { $env:AUTODEV_CONFIG = $PreviousConfig }
+  } finally { $env:AUTODEV_CONFIG = $PreviousConfig; $env:AUTODEV_CODEX_EXECUTABLE = $PreviousCodex }
 }
 
 function Stop-AutoDev {
   $Record = Read-AutoDevProcessRecord $RecordPath
   if (-not $Record) { Write-Output 'No managed AutoDev process record exists.'; return }
-  $Info = Get-AutoDevProcessInfo ([int]$Record.pid)
-  if (-not $Info) { Remove-Item -LiteralPath $RecordPath -Force; Write-Output 'AutoDev is stopped; stale process record removed.'; return }
+  $Info = Get-AutoDevRecordedProcess $Record
+  if (-not $Info) {
+    $Config = Read-AutoDevConfig $ConfigPath
+    if (-not (Test-AutoDevPortFree ([int]$Config.port))) { throw 'Refusing to stop: the old process is absent but its port has an unverified listener. No process or record was changed.' }
+    Remove-Item -LiteralPath $RecordPath -Force; Write-Output 'AutoDev is stopped; stale process record removed.'; return
+  }
   if (-not (Test-AutoDevOwnedProcess $Record $Info $Root)) { throw 'Refusing to stop: PID, creation time, executable or workspace command did not match.' }
   $Config = Read-AutoDevConfig $ConfigPath
-  try { $null = Invoke-AutoDevAdmin $Config $Runtime '/admin/shutdown' 'Post' @{} } catch { Write-Output 'Graceful shutdown was unavailable; stopping the verified owned process tree.' }
-  $Deadline = [DateTime]::UtcNow.AddSeconds(8)
+  $Status = Invoke-AutoDevAdmin $Config $Runtime '/admin/status'
+  Assert-AutoDevServerIdentity $Status $Record
+  if ($Status.active_job_id -or $null -eq $Status.PSObject.Properties['active_job_id'] -or $null -eq $Status.tasks -or @($Status.tasks | Where-Object { -not (Test-AutoDevTerminalOrUndispatchedTask $_) }).Count -gt 0) { throw 'Active or recovery-required work prevents shutdown. Reconcile the existing task first; no process was stopped.' }
+  # The server performs a second atomic dispatch/active check. Authentication,
+  # transport or refusal is never permission to force-kill an uncertain task.
+  $null = Invoke-AutoDevAdmin $Config $Runtime '/admin/shutdown' 'Post' @{}
+  $Deadline = [DateTime]::UtcNow.AddSeconds(35)
   do {
-    if (-not (Get-AutoDevProcessInfo ([int]$Record.pid))) { break }
+    if (-not (Get-AutoDevRecordedProcess $Record)) { break }
     Start-Sleep -Milliseconds 100
   } while ([DateTime]::UtcNow -lt $Deadline)
-  Stop-AutoDevOwnedTree $Record $Root
+  if (Get-AutoDevRecordedProcess $Record) { throw 'AutoDev shutdown was accepted but complete process exit was not confirmed. Process and ownership record were preserved; inspect shutdown status before retrying.' }
   Remove-Item -LiteralPath $RecordPath -Force
   Write-Output 'AutoDev stopped.'
 }
@@ -168,11 +180,11 @@ try {
       Assert-AutoDevStoppedForBuild
       if (-not (Test-Path -LiteralPath $Runtime)) { Protect-AutoDevRuntime $Runtime }
       Invoke-AutoDevMaintenance {
-        $Node = (Get-Command node.exe -ErrorAction Stop).Source
+        $Node = Resolve-AutoDevNode
         $Version = & $Node --version
         Assert-AutoDevExit 'Node version check' $LASTEXITCODE
         if ([int]($Version.TrimStart('v').Split('.')[0]) -lt 20) { throw 'Node.js 20 or later is required.' }
-        $null = Get-Command codex -ErrorAction Stop
+        $null = Resolve-AutoDevCodex
         $null = Get-Command npm.cmd -ErrorAction Stop
         if (Test-Path -LiteralPath $ConfigPath) { Assert-AutoDevOfflineState $Runtime }
         elseif (@('jobs.json', 'product-state.json', 'requests.json') | Where-Object { Test-Path -LiteralPath (Join-Path $Runtime $_) }) { throw 'Persisted state exists without its runtime configuration; recover the matching configuration before setup.' }
@@ -219,7 +231,7 @@ try {
       $Config = Read-AutoDevConfig $ConfigPath
       $Record = Read-AutoDevProcessRecord $RecordPath
       if (-not $Record) { Write-Output 'AutoDev is stopped (no process record).'; break }
-      $Info = Get-AutoDevProcessInfo ([int]$Record.pid)
+      $Info = Get-AutoDevRecordedProcess $Record
       if (-not $Info) { Write-Output 'AutoDev is stopped (stale process record).'; break }
       if (-not (Test-AutoDevOwnedProcess $Record $Info $Root)) { throw 'Process identity mismatch; no process was changed.' }
       $Status = Invoke-AutoDevAdmin $Config $Runtime '/admin/status'
@@ -227,18 +239,20 @@ try {
       $Status | ConvertTo-Json -Depth 30
     }
     'doctor' {
-      & node.exe --version
+      $Node = Resolve-AutoDevNode
+      $Codex = Resolve-AutoDevCodex
+      & $Node --version
       Assert-AutoDevExit 'Node version check' $LASTEXITCODE
-      & codex --version
+      & $Codex --version
       Assert-AutoDevExit 'Codex version check' $LASTEXITCODE
-      & codex login status
+      & $Codex login status
       Assert-AutoDevExit 'Official Codex login check' $LASTEXITCODE
       $Config = Read-AutoDevConfig $ConfigPath
       Write-Output "Requested model: $($Config.model); effort: $($Config.reasoningEffort). Effective availability is checked by App Server startup."
       Write-Output "Configured project count: $(@($Config.projects).Count). Port: $($Config.port)."
       $Record = Read-AutoDevProcessRecord $RecordPath
       if ($Record) {
-        $Info = Get-AutoDevProcessInfo ([int]$Record.pid)
+        $Info = Get-AutoDevRecordedProcess $Record
         if ($Info -and -not (Test-AutoDevOwnedProcess $Record $Info $Root)) { throw 'Recorded process identity mismatch.' }
         if ($Info) {
           $Status = Invoke-AutoDevAdmin $Config $Runtime '/admin/status'
@@ -252,7 +266,7 @@ try {
     'add-project' {
       if ($ProjectId -notmatch '^[a-z][a-z0-9-]{0,47}$' -or [string]::IsNullOrWhiteSpace($ProjectPath)) { throw 'Provide -ProjectId (lowercase letters, digits, hyphens) and an explicit -ProjectPath.' }
       if (-not [IO.Path]::IsPathRooted($ProjectPath) -or $ProjectPath.StartsWith('\\')) { throw 'ProjectPath must be an absolute local directory, not a UNC path.' }
-      $Node = (Get-Command node.exe -ErrorAction Stop).Source
+      $Node = Resolve-AutoDevNode
       # Keep native stdout ASCII: the Windows console may decode UTF-8 as CP950.
       $CanonicalBase64 = & $Node -e 'const fs=require(''node:fs'');const p=fs.realpathSync.native(process.argv[1]);if(!fs.statSync(p).isDirectory())process.exit(2);process.stdout.write(Buffer.from(p,''utf8'').toString(''base64''))' $ProjectPath
       Assert-AutoDevExit 'Resolving project directory' $LASTEXITCODE

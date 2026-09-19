@@ -7,6 +7,12 @@ import test from "node:test";
 
 import { EvidenceError, EvidenceStore, redactSensitiveText, type EvidenceIdentity } from "../src/evidence.js";
 
+test('password DOM selectors and CSS pseudo-elements remain reviewable while real values redact',()=>{
+  for(const source of ["const password = $('#password');", "const password = document.querySelector('#password');", '#password::placeholder { color: gray; }'])assert.equal(redactSensitiveText(source),source);
+  for(const source of ['password="SENSITIVE_VALUE"', "const password = 'SENSITIVE_VALUE';", 'password=SENSITIVE_VALUE', 'password: SENSITIVE_VALUE', 'client_secret="SENSITIVE_VALUE"'])assert.ok(!redactSensitiveText(source).includes('SENSITIVE_VALUE'));
+  assert.equal(redactSensitiveText("password = arbitraryFunction('secret');"),'password = [REDACTED];');
+});
+
 const testRoot = path.resolve(".local-tests");
 const identity: EvidenceIdentity = { jobId: "job-1", threadId: "thread-1", turnId: "turn-1", revision: 1 };
 

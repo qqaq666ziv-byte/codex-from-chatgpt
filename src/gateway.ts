@@ -74,14 +74,14 @@ export async function createGateway(options: Options) {
       if (req.method === 'POST' && url.pathname === '/oauth/token') return jsonResult(200, gate.token(new URLSearchParams(await req.read())));
       if (req.method === 'GET' && url.pathname === '/oauth/authorize') {
         const pending = gate.begin(url.searchParams);
-        return result(200, `<!doctype html><html lang="zh-Hant"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><meta http-equiv="refresh" content="3;url=/oauth/result?request_id=${encodeURIComponent(pending.request_id)}"><title>AutoDev 連線核准</title><style>body{font:18px system-ui;max-width:640px;margin:12vh auto;padding:24px;line-height:1.7;background:#f5f5f3;color:#202624}code{word-break:break-all}</style><h1>確認連接 AutoDev</h1><p>請在執行 AutoDev 的電腦核對下列代碼，並使用本機連線管理指令批准。這會允許此連線交辦、查看證據及記錄審查；Codex 提權仍需另外核准。</p><p>應用程式：${escape(pending.client_name)}</p><p>核對碼：<strong>${escape(pending.verification_code)}</strong></p><p>請求：<code>${escape(pending.request_id)}</code></p><p>此頁會自動等待核准。不需要 OpenAI API Key，也不收取 API 模型費用。</p></html>`, [['content-type', 'text/html; charset=utf-8'], ['cache-control', 'no-store'], ['referrer-policy', 'no-referrer'], ['content-security-policy', "default-src 'none'; style-src 'unsafe-inline'; form-action 'none'; frame-ancestors 'none'"]]);
+        return result(200, `<!doctype html><html lang="zh-Hant"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><meta http-equiv="refresh" content="3;url=/oauth/result?request_id=${encodeURIComponent(pending.request_id)}"><title>AutoDev 連線核准</title><style>body{font:18px system-ui;max-width:640px;margin:12vh auto;padding:24px;line-height:1.7;background:#f5f5f3;color:#202624}code{word-break:break-all}</style><h1>確認連接 AutoDev</h1><p>請在執行 AutoDev 的電腦核對下列代碼，並使用本機連線管理指令批准。這會允許此連線交辦、查看證據及記錄審查；Codex 提權仍需另外核准。</p><p>本次授權持續有效，沒有固定天數或更新次數上限。access token 每 10 分鐘到期，由此連線自動更新；你可以使用本機管理指令撤銷授權。</p><p>應用程式：${escape(pending.client_name)}</p><p>核對碼：<strong>${escape(pending.verification_code)}</strong></p><p>請求：<code>${escape(pending.request_id)}</code></p><p>此頁會自動等待核准。不需要 OpenAI API Key，也不收取 API 模型費用。</p></html>`, [['content-type', 'text/html; charset=utf-8'], ['cache-control', 'no-store'], ['referrer-policy', 'no-referrer'], ['content-security-policy', "default-src 'none'; style-src 'unsafe-inline'; form-action 'none'; frame-ancestors 'none'"]]);
       }
       if (req.method === 'GET' && url.pathname === '/oauth/result') {
         const id = url.searchParams.get('request_id') ?? '';
         const decision = gate.finish(id);
         if (decision.status === 'pending') {
           const pending = gate.pendingRequests().find(value => value.request_id === id);
-          return result(200, `<!doctype html><html lang="zh-Hant"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><meta http-equiv="refresh" content="3"><title>等待 AutoDev 核准</title><h1>等待本機核准</h1><p>應用程式：${escape(pending?.client_name ?? '')}</p><p>核對碼：<strong>${escape(pending?.verification_code ?? '')}</strong></p><p>請求：<code>${escape(id)}</code></p><p>請在本機使用 ${managementCommand} 核對並執行 approve。此頁會自動接續。</p></html>`, [['content-type', 'text/html; charset=utf-8'], ['cache-control', 'no-store'], ['referrer-policy', 'no-referrer'], ['content-security-policy', "default-src 'none'; frame-ancestors 'none'"]]);
+          return result(200, `<!doctype html><html lang="zh-Hant"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><meta http-equiv="refresh" content="3"><title>等待 AutoDev 核准</title><h1>等待本機核准</h1><p>本次授權持續有效直到撤銷，允許同一 AutoDev 連線交辦、讀取證據及記錄審查。沒有固定天數或更新次數上限；可透過本機管理指令撤銷。</p><p>應用程式：${escape(pending?.client_name ?? '')}</p><p>核對碼：<strong>${escape(pending?.verification_code ?? '')}</strong></p><p>請求：<code>${escape(id)}</code></p><p>請在本機使用 ${managementCommand} 核對並執行 approve。此頁會自動接續。</p></html>`, [['content-type', 'text/html; charset=utf-8'], ['cache-control', 'no-store'], ['referrer-policy', 'no-referrer'], ['content-security-policy', "default-src 'none'; frame-ancestors 'none'"]]);
         }
         return result(302, '', [['location', decision.redirect_url], ['cache-control', 'no-store'], ['referrer-policy', 'no-referrer']]);
       }
@@ -143,18 +143,49 @@ export async function createGateway(options: Options) {
   });
 
   const controlServer = createServer(async (req, res) => {
+    let stage = 'authorization';
     try {
       if (req.headers.host !== `127.0.0.1:${options.controlPort}` || req.headers.origin) { json(res, 403, { error: 'invalid_origin' }); return; }
       if (!authorized(req.headers.authorization, options.adminToken)) { json(res, 401, { error: 'authentication_required' }); return; }
       if (req.url === '/status' && req.method === 'GET') { json(res, 200, { process_id: process.pid, instance_id: options.instance ?? 'test', issuer: options.issuer, pending: gate.pendingRequests() }); return; }
+      if (req.url === '/grants' && req.method === 'GET') { json(res, 200, { grants: gate.authorizations() }); return; }
+      if (req.url === '/revoke' && req.method === 'POST') {
+        const value: unknown = JSON.parse(await body(req));
+        if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).join(',') !== 'grant_id' || !('grant_id' in value) || typeof value.grant_id !== 'string') throw new Error('Invalid revocation.');
+        json(res, 200, gate.revokeAuthorization(value.grant_id)); return;
+      }
       if (req.url === '/approve' && req.method === 'POST') {
-        const value = JSON.parse(await body(req)) as Record<string, unknown>;
-        if (typeof value.request_id !== 'string' || typeof value.verification_code !== 'string' || typeof value.approve !== 'boolean') throw new Error('Invalid approval.');
+        stage = 'read_body';
+        const content = await body(req);
+        stage = 'parse_body';
+        const value = JSON.parse(content) as Record<string, unknown> | null;
+        stage = 'validate_body';
+        if (!value || typeof value.request_id !== 'string' || typeof value.verification_code !== 'string' || typeof value.approve !== 'boolean') throw new Error('Invalid approval.');
+        stage = 'local_approval';
         json(res, 200, gate.localApproval(value.request_id, value.approve, value.verification_code)); return;
       }
       if (req.url === '/shutdown' && req.method === 'POST') { json(res, 200, { stopping: true }); setImmediate(() => options.onShutdown?.()); return; }
       json(res, 404, { error: 'not_found' });
-    } catch { json(res, 400, { error: 'request_rejected' }); }
+    } catch (error) {
+      // Local authenticated diagnostics use fixed labels, never request bodies,
+      // codes, redirects, credentials, exception messages or stack traces.
+      const reasons: Record<string, string> = {
+        'Consent request is unknown, expired or already redeemed': 'consent_unavailable',
+        'Verification code does not match this pending request': 'verification_code_mismatch',
+        'This request has already received a local decision': 'already_decided',
+        'Client is unknown; register this connection again': 'client_unavailable',
+        'OAuth grant capacity reached; revoke unused local authorizations': 'grant_capacity',
+        'OAuth authorization storage requires local recovery': 'storage_unavailable',
+        'OAuth authorization state could not be committed; local recovery is required': 'storage_commit_failed',
+        'Development OAuth request rate exceeded; wait before retrying': 'rate_limit',
+        'Gateway clock is unavailable': 'clock_unavailable',
+      };
+      json(res, error instanceof OAuthError ? error.status : 400, {
+        error: error instanceof OAuthError ? error.code : 'request_rejected', stage,
+        reason: error instanceof OAuthError ? reasons[error.message] ?? 'oauth_rejected' :
+          error instanceof SyntaxError ? 'invalid_json' : error instanceof TypeError ? 'type_error' : 'invalid_request_body',
+      });
+    }
   });
   publicServer.requestTimeout = 65_000; controlServer.requestTimeout = 10_000;
   const close = async () => { for (const server of [publicServer, controlServer]) { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); } relay?.close(); };

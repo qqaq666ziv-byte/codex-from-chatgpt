@@ -297,5 +297,12 @@ export function redactSensitiveText(text: string): string {
   return text
     .replace(/\b(?:sk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{16,}|github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|AIza[A-Za-z0-9_-]{30,})\b/g, "[REDACTED]")
     .replace(/\b(Bearer\s+)[A-Za-z0-9._~+\/-]+=*/gi, "$1[REDACTED]")
-    .replace(/(\b(?:access_token|refresh_token|id_token|api_key|apikey|client_secret|password)\b["']?\s*[:=]\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s&,;\r\n]+)/gi, "$1[REDACTED]");
+    .replace(/(\b(?:access_token|refresh_token|id_token|api_key|apikey|client_secret|password)\b["']?\s*(?::(?!:)|=)\s*)("[^"\r\n]*"|'[^'\r\n]*'|[^\s&,;\r\n]+)/gi,
+      (match,prefix:string,value:string)=>{
+        // A literal DOM selector is source code, not a credential value. Keep
+        // this exception exact; arbitrary function calls and scalar secrets
+        // still redact. CSS ::pseudo-elements are excluded by the delimiter.
+        if(/^password\s*=\s*$/i.test(prefix)&&/^(?:\$|document\.(?:querySelector|getElementById))\(['"]#[A-Za-z][A-Za-z0-9_-]*['"]\)$/.test(value))return match;
+        return `${prefix}[REDACTED]`;
+      });
 }

@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { createGateway } from './gateway.js';
 import { loadLocalConfig, readLocalToken } from './local-config.js';
 import { acquireRuntimeLock } from './runtime-lock.js';
-import { processIdentity, type OwnedProcess } from './secure-process.js';
+import { processIdentity, processBirthMatches, type OwnedProcess } from './secure-process.js';
 import { startWindowsJob, type WindowsJob } from './windows-job.js';
 import { assertFixedActivation, assertRouteCredential, boundedJson, configuredFixedTunnel, fixedAgentConfig, fixedArguments, fixedEnvironment, fixedExternalMetadata, fixedPorts, fixedRelease, loadFixedConfig, publishRoute, quickTunnelOrigin, routeLeaseClock, verifyFixedBinary, type FixedConfig } from './fixed-tunnel.js';
 
@@ -18,7 +18,8 @@ const configFile = path.join(runtime, 'fixed-tunnel.json');
 const recordFile = path.join(runtime, 'fixed-gateway-process.json');
 const binary = path.join(root, '.tools', 'cloudflared-2026.8.2.exe');
 const powershell = path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
-type ManagedRecord = OwnedProcess & { schemaVersion: 1; publicPort: 8798; controlPort: 8799; nativeAdminPort: 8800; childPid: number; childCreated: string; shutdownConfirmed: boolean; startupConfirmed?: boolean; routeExpiresAt?: string; failure?: 'native_exit' | 'shutdown_unconfirmed' | 'route_lease_expired' };
+type ProbeDiagnostic = { httpStatus?: number; instanceMatches?: boolean; metadataMatches?: boolean; workerStage?: string; error?: 'timeout' | 'transport' };
+type ManagedRecord = OwnedProcess & { schemaVersion: 1; publicPort: 8798; controlPort: 8799; nativeAdminPort: 8800; childPid: number; childCreated: string; shutdownConfirmed: boolean; startupConfirmed?: boolean; startupProbe?: ProbeDiagnostic; routeExpiresAt?: string; failure?: 'native_exit' | 'shutdown_unconfirmed' | 'route_lease_expired' };
 const pause = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 function atomic(file: string, value: unknown) {
   const temporary = `${file}.${randomUUID()}.tmp`;
@@ -35,6 +36,8 @@ function record(): ManagedRecord | undefined {
 function owned(previous: ManagedRecord) {
   const current = processIdentity(previous.pid);
   if (!current) return null;
+  // A reused PID is a different process, not the old supervisor. Never touch it.
+  if (!processBirthMatches(previous.created, current.created)) return null;
   if (!/^[a-f0-9-]{36}$/.test(previous.instance) || path.resolve(previous.entry) !== entry || previous.executable.toLowerCase() !== process.execPath.toLowerCase() ||
     current.executable.toLowerCase() !== previous.executable.toLowerCase() || current.created !== previous.created ||
     !current.command.includes(entry) || !current.command.includes(`--autodev-fixed-instance=${previous.instance}`)) throw new Error('PROCESS_IDENTITY_MISMATCH: no fixed gateway process was changed.');
@@ -99,18 +102,26 @@ async function status(previous: ManagedRecord, config: FixedConfig) {
     try {
       const response = await fetch(`${config.origin}/_autodev/health`, { signal: AbortSignal.timeout(5000), redirect: 'error' });
       const health = await boundedJson(response) as { ok?: unknown; routeReady?: unknown } | null; workerReady = health?.ok === true && health.routeReady === true;
-      external = await externalProbe(config, previous.instance);
+      for (let attempt = 0; attempt < 3 && !external; attempt++) {
+        try { external = await externalProbe(config, previous.instance); } catch { /* bounded read-only retry */ }
+        if (!external && attempt < 2) await pause(500 * (attempt + 1));
+      }
     } catch { /* Worker health alone cannot establish this run's relay route. */ }
   }
   return { process_running: true, native_process_running: nativeRunning, native_ready: nativeReady, core_ready: coreReady, worker_route_ready: workerReady, route_lease_valid: leaseValid, external_metadata_ready: external,
     blocked: previous.failure ?? (!leaseValid ? 'route_lease_expired' : null), pending_approval_count: Array.isArray(control.pending) ? control.pending.length : 0,
-    ready_for_chatgpt_probe: nativeRunning && nativeReady && leaseValid && coreReady && external && !previous.failure,
+    startup_confirmed: previous.startupConfirmed === true, startup_probe: previous.startupProbe,
+    ready_for_chatgpt_probe: nativeRunning && nativeReady && leaseValid && coreReady && external && !previous.failure && previous.startupConfirmed === true,
     chatgpt_e2e: 'not_verified', cost_status: config.cost.status, paid_fallback: false };
 }
-async function externalProbe(config: FixedConfig, instance: string) {
-  const response = await fetch(`${config.origin}/.well-known/oauth-authorization-server`, { signal: AbortSignal.timeout(8000), redirect: 'error', headers: { Accept: 'application/json', 'User-Agent': 'AutoDev-FixedProbe/1.0' } });
+async function externalProbe(config: FixedConfig, instance: string, diagnostic?: (value: ProbeDiagnostic) => void) {
+  const response = await fetch(`${config.origin}/.well-known/oauth-authorization-server`, { signal: AbortSignal.timeout(8000), redirect: 'error', headers: { Accept: 'application/json', 'User-Agent': 'AutoDev-FixedProbe/1.0', Connection: 'close' } });
   const sameInstance = response.headers.get('x-autodev-instance') === instance;
-  return fixedExternalMetadata(await boundedJson(response), config.origin) && sameInstance;
+  const metadataMatches = fixedExternalMetadata(await boundedJson(response), config.origin);
+  const stage = response.headers.get('x-autodev-failure') ?? '';
+  diagnostic?.({ httpStatus: response.status, instanceMatches: sameInstance, metadataMatches,
+    ...(/^(?:request_validation|route_auth|route_write|route_lookup|request_crypto|relay_fetch|relay_encoding|relay_content_type|response_crypto|public_response|relay_http_[1-5][0-9]{2})$/.test(stage) ? { workerStage: stage } : {}) });
+  return metadataMatches && sameInstance;
 }
 async function run() {
   const release = await lease();
@@ -197,7 +208,9 @@ async function run() {
       await renew();
       const workerDeadline = Date.now() + 90000; let propagated = false;
       while (!closing && Date.now() < workerDeadline && !propagated) {
-        try { propagated = await externalProbe(config, instance); } catch { /* KV propagation is eventual. */ }
+        try { propagated = await externalProbe(config, instance, value => { managed!.startupProbe = value; }); }
+        catch (error) { managed.startupProbe = { error: error instanceof Error && ['TimeoutError','AbortError'].includes(error.name) ? 'timeout' : 'transport' }; }
+        atomic(recordFile, managed); // Persistence failure is not a transport classification.
         if (!propagated) await pause(1500);
       }
       if (closing || !propagated) throw new Error('The Worker did not confirm this run through the encrypted relay. No ChatGPT success was inferred.');
@@ -210,7 +223,7 @@ async function run() {
 async function stdin() { let value = ''; for await (const chunk of process.stdin) { value += String(chunk); if (value.length > 16384) throw new Error('Local input is too large.'); } return value.trim(); }
 async function main() {
   const action = process.argv[2] ?? 'help';
-  if (action === 'help') { console.log('Fixed Cloudflare connection: setup | configure | credential (local prompt) | start | run | status | doctor | stop | restart | approve | deny | connection-info. Current free service, quota or credit evidence and six no-charge safeguards are required.'); return; }
+  if (action === 'help') { console.log('Fixed Cloudflare connection: setup | configure | credential (local prompt) | start | run | status | doctor | stop | restart | approve | deny | grants | revoke <grant-id> | connection-info. Current free service, quota or credit evidence and six no-charge safeguards are required.'); return; }
   if (action === 'setup') { const release = await lease(); try { await setup(); console.log('Verified pinned cloudflared executable hash. No account or tunnel was contacted.'); } finally { release(); } return; }
   if (action === 'configure') {
     const release = await lease();
@@ -234,7 +247,7 @@ async function main() {
   }
   if (action === 'connection-info') { const config = loadFixedConfig(runtime); console.log(JSON.stringify({ mcp_url: `${config.origin}/mcp`, oauth_metadata_url: `${config.origin}/.well-known/oauth-authorization-server`, authentication: 'OAuth', status: 'manual_setup_information_not_e2e_proof' }, null, 2)); return; }
   if (action === 'run') { await run(); return; }
-  if (!['status', 'stop', 'approve', 'deny'].includes(action)) throw new Error('Unknown fixed gateway action.');
+  if (!['status', 'stop', 'approve', 'deny', 'grants', 'revoke'].includes(action)) throw new Error('Unknown fixed gateway action.');
   const previous = record();
   if (!previous || !owned(previous)) {
     const native = previous ? nativeOwned(previous) : false;
@@ -245,10 +258,36 @@ async function main() {
   const config = loadFixedConfig(runtime);
   if (action === 'status') { console.log(JSON.stringify(await status(previous, config), null, 2)); return; }
   await gatewayStatus(previous);
-  const request = action === 'stop' ? {} : { request_id: process.argv[3], verification_code: process.argv[4], approve: action === 'approve' };
-  const response = await fetch(`http://127.0.0.1:${previous.controlPort}/${action === 'stop' ? 'shutdown' : 'approve'}`, { method: 'POST', headers: { Authorization: `Bearer ${readLocalToken(runtime, 'admin')}`, 'Content-Type': 'application/json' }, body: JSON.stringify(request), signal: AbortSignal.timeout(5000), redirect: 'error' });
-  if (!response.ok) throw new Error('Fixed gateway rejected the local action.'); await response.body?.cancel();
-  if (action !== 'stop') { console.log(action === 'approve' ? 'Matching local OAuth request approved.' : 'Matching local OAuth request denied.'); return; }
+  if (action === 'revoke' && !/^[A-Za-z0-9_-]{43}$/.test(process.argv[3] ?? '')) throw new Error('Provide a grant ID listed by the grants action.');
+  const request = action === 'stop' ? {} : action === 'revoke' ? { grant_id: process.argv[3] } : { request_id: process.argv[3], verification_code: process.argv[4], approve: action === 'approve' };
+  const endpoint = action === 'stop' ? 'shutdown' : action === 'grants' || action === 'revoke' ? action : 'approve';
+  const response = await fetch(`http://127.0.0.1:${previous.controlPort}/${endpoint}`, { method: action === 'grants' ? 'GET' : 'POST', headers: { Authorization: `Bearer ${readLocalToken(runtime, 'admin')}`, 'Content-Type': 'application/json' }, ...(action === 'grants' ? {} : { body: JSON.stringify(request) }), signal: AbortSignal.timeout(5000), redirect: 'error' });
+  if (!response.ok) {
+    let detail = '';
+    try {
+      // The probe parser normally ignores non-2xx bodies; parse this error body
+      // through its existing content-type/size bounds without losing the status.
+      const value = await boundedJson(new Response(response.body, { headers: response.headers })) as Record<string, unknown> | null;
+      const allowed = new Set(['authentication_required', 'invalid_origin', 'not_found', 'invalid_request', 'invalid_client', 'access_denied', 'temporarily_unavailable', 'request_rejected',
+        'authorization', 'read_body', 'parse_body', 'validate_body', 'local_approval', 'consent_unavailable', 'verification_code_mismatch', 'already_decided', 'client_unavailable',
+        'grant_capacity', 'storage_unavailable', 'storage_commit_failed', 'rate_limit', 'clock_unavailable', 'oauth_rejected', 'invalid_json', 'type_error', 'invalid_request_body']);
+      for (const key of ['error', 'stage', 'reason']) if (typeof value?.[key] === 'string' && allowed.has(value[key])) detail += ` ${key} ${value[key]}.`;
+    } catch { /* Never print a raw gateway or intermediary response. */ }
+    throw new Error(`Fixed gateway rejected the local action. HTTP ${response.status}.${detail}`);
+  }
+  if (action === 'grants') {
+    const value = await boundedJson(response) as { grants?: unknown } | null;
+    if (!Array.isArray(value?.grants) || value.grants.length > 32) throw new Error('Invalid local authorization list.');
+    const grants = value.grants.map((entry: unknown) => {
+      if (!entry || typeof entry !== 'object') throw new Error('Invalid local authorization entry.');
+      const v = entry as Record<string, unknown>;
+      if (typeof v.grant_id !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(v.grant_id) || typeof v.client_name !== 'string' || v.client_name.length > 120 || /[\x00-\x1f\x7f]/.test(v.client_name) || v.scope !== 'autodev' || !(v.expires_at === null || (typeof v.expires_at === 'string' && Number.isFinite(Date.parse(v.expires_at))))) throw new Error('Invalid local authorization entry.');
+      return { grant_id: v.grant_id, client_name: v.client_name, scope: v.scope, expires_at: v.expires_at };
+    });
+    console.log(JSON.stringify({ grants }, null, 2)); return;
+  }
+  await response.body?.cancel();
+  if (action !== 'stop') { console.log(action === 'revoke' ? 'Matching local OAuth grant revoked.' : action === 'approve' ? 'Matching local OAuth request approved.' : 'Matching local OAuth request denied.'); return; }
   for (let index = 0; index < 50; index++) {
     if (!owned(previous)) {
       const final = record();

@@ -211,7 +211,8 @@ test("OAuth authorization requires the matching local verification code and a bo
   assert.equal(awaiting.status, 200);
   assert.equal(awaiting.headers.get("location"), null);
   const wrongCode = await localDecision(f, flow, "incorrect-confirmation-code");
-  assert.equal(wrongCode.status, 400);
+  assert.equal(wrongCode.status, 403);
+  assert.deepEqual(await wrongCode.json(), { error: 'access_denied', stage: 'local_approval', reason: 'verification_code_mismatch' });
   assert.ok((await pending(f)).some(entry => entry.request_id === flow.request.request_id));
   const code = await approvedCode(f, flow);
   const exchange = await redeem(f, flow, code);
@@ -238,6 +239,22 @@ test("OAuth authorization requires the matching local verification code and a bo
   assert.equal(denialLocation.searchParams.get("error"), "access_denied");
   assert.equal(denialLocation.searchParams.get("code"), null);
   assert.equal(denialLocation.searchParams.get("state"), denied.state);
+  assert.equal(f.requests.length, 0);
+});
+
+test('local approval diagnostics distinguish body validation from missing consent without echoing input', async t => {
+  const f = await fixture(t);
+  for (const [body, expected] of [
+    ['{private-payload', { error: 'request_rejected', stage: 'parse_body', reason: 'invalid_json' }],
+    ['null', { error: 'request_rejected', stage: 'validate_body', reason: 'invalid_request_body' }],
+    [JSON.stringify({ request_id: 'synthetic-private-request', verification_code: 'synthetic-private-code', approve: true }),
+      { error: 'invalid_request', stage: 'local_approval', reason: 'consent_unavailable' }],
+  ] as const) {
+    const response = await fetch(f.controlUrl + '/approve', { method: 'POST', headers: { Authorization: `Bearer ${adminToken}`, 'Content-Type': 'application/json' }, body });
+    assert.equal(response.status, 400);
+    assert.deepEqual(await response.json(), expected);
+  }
+  assert.deepEqual(await pending(f), []);
   assert.equal(f.requests.length, 0);
 });
 
@@ -304,4 +321,30 @@ test("gateway rejects GET streaming and never exposes an upstream SSE response",
   assert.equal(streaming.status, 400);
   assert.doesNotMatch(streaming.headers.get("content-type") ?? "", /text\/event-stream/);
   assert.doesNotMatch(await streaming.text(), /should not be forwarded/);
+});
+
+
+test('authorization listing and revocation require the authenticated local channel', async t => {
+  const f = await fixture(t);
+  const { client_id: client } = await register(f);
+  const tokens = await access(f, client);
+  const headers = { Authorization: 'Bearer ' + adminToken, 'Content-Type': 'application/json' };
+  for (const route of ['/grants', '/revoke']) {
+    for (const method of ['GET', 'POST']) {
+      assert.equal((await fetch(f.publicUrl + route, { method })).status, 404);
+      assert.equal((await fetch(f.controlUrl + route, { method })).status, 401);
+      assert.equal((await fetch(f.controlUrl + route, { method, headers: { ...headers, Origin: 'https://untrusted.example' } })).status, 403);
+    }
+  }
+  const listing = await fetch(f.controlUrl + '/grants', { headers });
+  const payload = await listing.json() as { grants: { grant_id: string; expires_at: null }[] };
+  assert.equal(payload.grants.length, 1);
+  assert.equal(payload.grants[0]!.expires_at, null);
+  assert.equal(JSON.stringify(payload).includes(tokens.refresh_token), false);
+  const revoked = await fetch(f.controlUrl + '/revoke', { method: 'POST', headers, body: JSON.stringify({ grant_id: payload.grants[0]!.grant_id }) });
+  assert.equal(revoked.status, 200);
+  const rejected = await fetch(f.publicUrl + '/mcp', { method: 'POST', headers: { Authorization: 'Bearer ' + tokens.access_token }, body: '{}' });
+  assert.equal(rejected.status, 401);
+  const refreshed = await fetch(f.publicUrl + '/oauth/token', { method: 'POST', body: new URLSearchParams({ grant_type: 'refresh_token', client_id: client, resource: issuer + '/mcp', refresh_token: tokens.refresh_token }) });
+  assert.equal(refreshed.status, 400);
 });

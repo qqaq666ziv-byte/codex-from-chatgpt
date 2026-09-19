@@ -8,21 +8,34 @@ $TaskMutex = $null
 $TaskOwnsMutex = $false
 
 function Invoke-DailyScript([string]$File, [string[]]$Values) {
-  # Isolated PowerShell makes a child script's exit code authoritative. Capture
-  # its output: core status may contain private work and is not a daily summary.
-  $TaskSavedPreference = $ErrorActionPreference
-  $ErrorActionPreference = 'Continue'
+  # Native pipeline capture waits for inherited handles held by background
+  # descendants even after the launcher exits. File redirection and waiting on
+  # this exact Process object keep core/transport lifetime independent.
+  $TaskId = [Guid]::NewGuid().ToString('N')
+  $TaskOut = Join-Path $TaskRoot ('.runtime/daily-' + $TaskId + '.stdout.log')
+  $TaskErr = Join-Path $TaskRoot ('.runtime/daily-' + $TaskId + '.stderr.log')
+  $TaskArguments = (@('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',$File) + $Values | ForEach-Object { ConvertTo-AutoDevNativeArgument $_ }) -join ' '
+  # Start-Process -RedirectStandardOutput itself creates pipes. Redirect in
+  # cmd to real file handles so descendants cannot retain a reader's pipe.
+  foreach ($TaskValue in @($TaskShell,$File,$TaskOut,$TaskErr) + $Values) {
+    if ($TaskValue -match '[%"\r\n]') { throw '啟動腳本路徑包含不支援的 Windows command 字元。' }
+  }
+  $TaskCommand = '/d /s /c ""' + $TaskShell + '" ' + $TaskArguments + ' 1>"' + $TaskOut + '" 2>"' + $TaskErr + '" <nul"'
   try {
-    $global:LASTEXITCODE = 1
-    $TaskLines = @(& $TaskShell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $File @Values 2>&1)
-    $TaskCode = $global:LASTEXITCODE
-  } finally { $ErrorActionPreference = $TaskSavedPreference }
-  return [pscustomobject]@{ Code = $TaskCode; Text = ($TaskLines -join "`n") }
+    $TaskChild = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32/cmd.exe') -ArgumentList $TaskCommand -WorkingDirectory $TaskRoot -WindowStyle Hidden -PassThru
+    $null = $TaskChild.Handle # Cache the handle before a short-lived launcher exits (PS 5.1).
+    if (-not $TaskChild.WaitForExit(300000)) { throw 'AutoDev core 或固定入口啟動程序逾時；保留程序供狀態核對。' }
+    $TaskReader = New-Object IO.StreamReader([IO.File]::Open($TaskOut, 'Open', 'Read', 'ReadWrite'))
+    try { $TaskText = $TaskReader.ReadToEnd() } finally { $TaskReader.Dispose() }
+    if ($null -eq $TaskChild.ExitCode) { throw 'AutoDev core 或固定入口啟動退出碼無法核對。' }
+    return [pscustomobject]@{ Code = $TaskChild.ExitCode; Text = $TaskText }
+  } finally { if ($TaskChild) { $TaskChild.Dispose() } }
 }
 
 try {
+  . (Join-Path $PSScriptRoot 'local-common.ps1')
   $TaskShell = if ($PSVersionTable.PSEdition -eq 'Core') { Join-Path $PSHOME 'pwsh.exe' } else { Join-Path $PSHOME 'powershell.exe' }
-  $TaskNode = (Get-Command node.exe -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+  $TaskNode = Resolve-AutoDevNode
   foreach ($TaskRelative in @('autodev.ps1', 'fixed-tunnel.ps1', 'local-common.ps1', 'backup-common.ps1')) {
     $TaskItem = Get-Item -LiteralPath (Join-Path $PSScriptRoot $TaskRelative) -Force -ErrorAction Stop
     if ($TaskItem.PSIsContainer -or ($TaskItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw '啟動腳本必須是本工作區的實體檔案。' }

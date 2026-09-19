@@ -1,4 +1,32 @@
 # Windows PowerShell 5.1 / PowerShell 7 helpers. Import has no side effects.
+function Test-AutoDevTerminalOrUndispatchedTask($Task) {
+  if ($Task.execution_status -in @('completed','interrupted','failed')) { return $true }
+  if ($Task.execution_status -ne 'blocked' -or $Task.status -ne 'blocked' -or $Task.routing_status -ne 'blocked' -or $Task.dispatch_status -ne 'not_dispatched') { return $false }
+  foreach ($Name in @('thread_id','turn_id')) {
+    if ($null -eq $Task.PSObject.Properties[$Name] -or $null -ne $Task.$Name) { return $false }
+  }
+  $Attempt = $Task.routing_attempt
+  if ($null -eq $Attempt -or $Attempt.operation -ne 'submit' -or $Attempt.round -ne 1 -or $Attempt.decision.status -ne 'blocked') { return $false }
+  foreach ($Name in @('selected_model','selected_effort')) {
+    if ($null -eq $Attempt.decision.PSObject.Properties[$Name] -or $null -ne $Attempt.decision.$Name) { return $false }
+  }
+  return $true
+}
+function Resolve-AutoDevApplication([string]$Pinned, [string[]]$Names) {
+  if (-not [string]::IsNullOrWhiteSpace($Pinned)) {
+    if (-not [IO.Path]::IsPathRooted($Pinned)) { throw 'Pinned application must use an absolute path.' }
+    $Item = Get-Item -LiteralPath $Pinned -Force -ErrorAction Stop
+    if ($Item.PSIsContainer -or ($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $Item.Extension -notin @('.exe','.cmd')) { throw 'Pinned application must be a physical executable or CMD shim.' }
+    return $Item.FullName
+  }
+  foreach ($Name in $Names) {
+    $Found = Get-Command $Name -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($Found) { return Resolve-AutoDevApplication $Found.Source @() }
+  }
+  throw 'Required application was not found. Install/select an existing executable; no download was attempted.'
+}
+function Resolve-AutoDevNode { return Resolve-AutoDevApplication $env:AUTODEV_NODE_EXECUTABLE @('node.exe') }
+function Resolve-AutoDevCodex { return Resolve-AutoDevApplication $env:AUTODEV_CODEX_EXECUTABLE @('codex.exe','codex.cmd') }
 function ConvertTo-AutoDevNativeArgument([AllowEmptyString()][string]$Value) {
   return '"' + [regex]::Replace([regex]::Replace($Value, '(\\*)"', '$1$1\"'), '(\\+)$', '$1$1') + '"'
 }
@@ -75,6 +103,16 @@ function Get-AutoDevProcessInfo([int]$ProcessId) {
     Import-Module (Join-Path $PSHOME 'Modules\CimCmdlets\CimCmdlets.psd1') -ErrorAction Stop
   }
   return Get-CimInstance Win32_Process -Filter "ProcessId = $ProcessId" -ErrorAction Stop
+}
+
+function Get-AutoDevRecordedProcess($Record) {
+  $Info = Get-AutoDevProcessInfo ([int]$Record.pid)
+  if (-not $Info) { return $null }
+  try {
+    $Recorded = if ($Record.created_utc -is [DateTime]) { $Record.created_utc.ToUniversalTime() } else { [DateTime]::Parse($Record.created_utc).ToUniversalTime() }
+  } catch { throw 'Invalid process creation record; no process was changed.' }
+  if ([Math]::Abs(($Recorded - ([DateTime]$Info.CreationDate).ToUniversalTime()).TotalMilliseconds) -ge 1) { return $null }
+  return $Info
 }
 
 function Test-AutoDevOwnedProcess($Record, $Info, [string]$Root) {

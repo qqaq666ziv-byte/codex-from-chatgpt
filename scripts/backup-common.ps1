@@ -6,12 +6,15 @@ function Get-AutoDevFileDigest([string]$File) {
   finally { $Hasher.Dispose(); $Stream.Dispose() }
 }
 
-function Assert-AutoDevPhysicalTree([string]$Directory) {
+function Assert-AutoDevPhysicalTree([string]$Directory, [switch]$SkipBackupExcluded) {
   $RootItem = Get-Item -LiteralPath $Directory -Force -ErrorAction Stop
   if (-not $RootItem.PSIsContainer -or ($RootItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Backup directories must be physical local directories.' }
-  foreach ($Item in Get-ChildItem -LiteralPath $Directory -Force) {
+  foreach ($Item in Get-ChildItem -LiteralPath $Directory -Force -ErrorAction Stop) {
     if ($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Backup refuses linked files or directories.' }
-    if ($Item.PSIsContainer) { Assert-AutoDevPhysicalTree $Item.FullName }
+    # Validate the excluded entry itself (including lease directories), but never
+    # descend into CLI caches, logs or other volatile trees outside the snapshot.
+    if ($SkipBackupExcluded -and (Test-AutoDevBackupExcluded $Item.Name)) { continue }
+    if ($Item.PSIsContainer) { Assert-AutoDevPhysicalTree $Item.FullName -SkipBackupExcluded:$SkipBackupExcluded }
   }
 }
 
@@ -37,7 +40,7 @@ function Enter-AutoDevOfflineLease([string]$Directory) {
 }
 
 function Assert-AutoDevOfflineState([string]$Directory) {
-  Assert-AutoDevPhysicalTree $Directory
+  Assert-AutoDevPhysicalTree $Directory -SkipBackupExcluded
   # The script reads private state only to validate its schema and idle status.
   # No state values, credentials, prompts or parser diagnostics reach stdout.
   $Script = @'
@@ -88,13 +91,24 @@ function Test-AutoDevBackupExcluded([string]$Relative) {
 }
 
 function Get-AutoDevBackupFiles([string]$Directory) {
+  # Do not use -Recurse: filtering its output happens after PowerShell has already
+  # entered excluded trees (including Windows-created CLI cache junctions).
   $Prefix = [IO.Path]::GetFullPath($Directory).TrimEnd('\') + '\'
-  return @(Get-ChildItem -LiteralPath $Directory -File -Recurse -Force | ForEach-Object {
-    $Relative = $_.FullName.Substring($Prefix.Length).Replace('\', '/')
-    if (-not (Test-AutoDevBackupExcluded $Relative)) {
-      [pscustomobject]@{ path = $Relative; bytes = $_.Length; sha256 = Get-AutoDevFileDigest $_.FullName }
+  $Pending = New-Object 'System.Collections.Generic.Stack[string]'
+  $Pending.Push($Directory)
+  $Files = while ($Pending.Count -gt 0) {
+    $Current = $Pending.Pop()
+    $CurrentItem = Get-Item -LiteralPath $Current -Force -ErrorAction Stop
+    if (-not $CurrentItem.PSIsContainer -or ($CurrentItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Backup directories must be physical local directories.' }
+    foreach ($Item in Get-ChildItem -LiteralPath $Current -Force -ErrorAction Stop) {
+      if ($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Backup refuses linked files or directories.' }
+      $Relative = $Item.FullName.Substring($Prefix.Length).Replace('\', '/')
+      if (Test-AutoDevBackupExcluded $Relative) { continue }
+      if ($Item.PSIsContainer) { $Pending.Push($Item.FullName) }
+      else { [pscustomobject]@{ path = $Relative; bytes = $Item.Length; sha256 = Get-AutoDevFileDigest $Item.FullName } }
     }
-  } | Sort-Object -Property path)
+  }
+  return @($Files | Sort-Object -Property path)
 }
 
 function Resolve-AutoDevBackup([string]$Root, [string]$BackupId) {

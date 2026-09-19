@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { lstatSync, readFileSync, realpathSync } from 'node:fs';
+import { existsSync, lstatSync, readFileSync, readdirSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { createTwoFilesPatch } from 'diff';
@@ -8,14 +8,35 @@ import { redactSensitiveText } from './evidence.js';
 export type SourceSnapshot={head:string|null;files:Record<string,{sha256:string;content:string}>;omitted:Array<{path:string;reason:string}>};
 const sha=(value:string|Buffer)=>createHash('sha256').update(value).digest('hex');
 function git(cwd:string,args:string[]):string { return execFileSync('git',['--no-optional-locks',...args],{cwd,windowsHide:true,encoding:'utf8',maxBuffer:8*1024*1024,stdio:['ignore','pipe','pipe']}); }
-export function snapshotSource(workspace:string):SourceSnapshot {
-  const root=realpathSync(workspace); const top=realpathSync(git(root,['rev-parse','--show-toplevel']).trim());
-  if (top.toLowerCase()!==root.toLowerCase()) throw new Error('Register the Git repository root, not a subfolder.');
-  let head:string|null=null; try {head=git(root,['rev-parse','--verify','HEAD']).trim();} catch { /* empty fixture */ }
-  const names=[...new Set(git(root,['ls-files','--cached','--others','--exclude-standard','-z']).split('\0').filter(Boolean))].sort();
+const sensitivePath=/(^|\/)(\.env(?:\..*)?|\.git|\.runtime|\.local-tests|\.ai-bridge|\.npmrc|\.netrc|\.pypirc|\.ssh|\.aws|\.kube|auth\.json|credentials?(?:\..*)?|.*\.pem|.*\.key|client-token|admin-token)(\/|$)/i;
+export function snapshotSource(workspace:string,allowUnversioned=false):SourceSnapshot {
+  const root=realpathSync(workspace);
   const files:SourceSnapshot['files']={}; const omitted:SourceSnapshot['omitted']=[]; let bytes=0;
+  let head:string|null=null;let names:string[];
+  if(allowUnversioned&&!existsSync(path.join(root,'.git'))){
+    names=[];let entries=0;
+    const walk=(directory:string,depth:number)=>{
+      if(depth>64)throw new Error('Source evidence exceeds directory depth limit.');
+      for(const entry of readdirSync(directory,{withFileTypes:true})){
+        if(++entries>10000)throw new Error('Source evidence exceeds 10000 entries; narrow the workspace.');
+        const file=path.join(directory,entry.name);const name=path.relative(root,file).split(path.sep).join('/');
+        if(sensitivePath.test(name)){omitted.push({path:name,reason:'sensitive_or_private_path'});continue;}
+        if(/(^|\/)(node_modules|dist|build|coverage|\.next|\.venv|venv)(\/|$)/i.test(name)){omitted.push({path:name,reason:'generated_or_dependency_path'});continue;}
+        const info=lstatSync(file);
+        if(info.isSymbolicLink()||!info.isDirectory()&&!info.isFile()){omitted.push({path:name,reason:'non_regular_file'});continue;}
+        if(realpathSync(file).toLowerCase()!==file.toLowerCase())throw new Error('Source path resolves through a link; evidence capture refused.');
+        if(info.isDirectory())walk(file,depth+1);else names.push(name);
+      }
+    };
+    walk(root,0);names.sort();omitted.sort((a,b)=>a.path.localeCompare(b.path));
+  }else{
+    const top=realpathSync(git(root,['rev-parse','--show-toplevel']).trim());
+    if (top.toLowerCase()!==root.toLowerCase()) throw new Error('Register the Git repository root, not a subfolder.');
+    try {head=git(root,['rev-parse','--verify','HEAD']).trim();} catch { /* empty repository */ }
+    names=[...new Set(git(root,['ls-files','--cached','--others','--exclude-standard','-z']).split('\0').filter(Boolean))].sort();
+  }
   for(const name of names) {
-    if (/(^|\/)(\.env(?:\..*)?|\.git|\.runtime|\.local-tests|\.ai-bridge|\.npmrc|\.netrc|\.pypirc|\.ssh|\.aws|\.kube|auth\.json|credentials?(?:\..*)?|.*\.pem|.*\.key|client-token|admin-token)(\/|$)/i.test(name)) { omitted.push({path:name,reason:'sensitive_or_private_path'}); continue; }
+    if (sensitivePath.test(name)) { omitted.push({path:name,reason:'sensitive_or_private_path'}); continue; }
     const file=path.resolve(root,name); const relative=path.relative(root,file);
     if(relative.startsWith(`..${path.sep}`)||path.isAbsolute(relative)) throw new Error('Invalid tracked path.');
     let stat; try {stat=lstatSync(file);} catch(e) { if((e as NodeJS.ErrnoException).code==='ENOENT') continue; throw e; }

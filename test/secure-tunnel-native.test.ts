@@ -70,27 +70,43 @@ async function fixture(t: TestContext) {
   assert.equal(createHash('sha256').update(readFileSync(binary)).digest('hex'), binarySha256, 'Run only the verified official v0.0.14 Windows binary');
   mkdirSync(testRoot, { recursive: true });
   const directory = mkdtempSync(path.join(testRoot, 'secure-tunnel-native-'));
+  const cleanupRoot = realpathSync(testRoot);
+  const cleanupDirectory = realpathSync(directory);
   const servers: Server[] = [];
   const children: ChildProcess[] = [];
+  const childClosures = new Map<ChildProcess, Promise<void>>();
   let gateway: Awaited<ReturnType<typeof createGateway>> | undefined;
   let handler: ReturnType<typeof createMcpHttpHandler> | undefined;
   async function stop(child: ChildProcess) {
-    if (child.exitCode !== null || child.signalCode !== null) return;
     assert.ok(children.includes(child), 'Only a process handle created by this fixture may be stopped');
-    const ended = new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error('The fixture tunnel process did not stop')), 5_000);
-      child.once('exit', () => { clearTimeout(timer); resolve(); });
-    });
-    assert.equal(child.kill(), true, 'Owned tunnel termination must actually be sent');
-    await ended;
+    const closed = childClosures.get(child); assert.ok(closed);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      if (child.exitCode === null && child.signalCode === null) {
+        assert.equal(child.kill(), true, 'Owned tunnel termination must actually be sent');
+      }
+      // exit can precede stdio/resource closure, including for a process that
+      // exited before stop was called. Observe the launch's own close event.
+      await Promise.race([closed, new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error('The fixture tunnel process did not close')), 5_000);
+      })]);
+    } finally { clearTimeout(timer); }
   }
   t.after(async () => {
     for (const child of children) await stop(child);
     await gateway?.close(); await handler?.close();
     for (const server of servers) await close(server);
-    const resolved = path.resolve(directory);
-    assert.ok(resolved.startsWith(testRoot + path.sep));
-    rmSync(resolved, { recursive: true, force: true });
+    const resolved = realpathSync(directory);
+    assert.equal(resolved, cleanupDirectory, 'The fixture directory must not have been replaced');
+    assert.equal(realpathSync(testRoot), cleanupRoot);
+    assert.equal(path.dirname(resolved), cleanupRoot, 'Only this direct .local-tests child may be removed');
+    // Windows may briefly retain filesystem handles after child close. Retry
+    // only this verified fixture path, with a bounded total delay of 1.5 s.
+    try { rmSync(resolved, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+    catch (error) {
+      if (!(error instanceof Error) || !('code' in error) || error.code !== 'EPERM') throw error;
+      t.diagnostic(`Retained synthetic fixture artifact: ${resolved}. All owned children closed; Windows denied cleanup (EPERM) after bounded retries.`);
+    }
   });
   const workspace = path.join(directory, 'repository'); const runtimeDir = path.join(directory, 'runtime');
   for (const dir of [workspace, runtimeDir, path.join(directory, 'profiles')]) mkdirSync(dir);
@@ -173,7 +189,9 @@ async function fixture(t: TestContext) {
     const healthFile = path.join(directory, `health-${children.length}.txt`);
     const env: NodeJS.ProcessEnv = { SystemRoot: process.env.SystemRoot, WINDIR: process.env.WINDIR, TEMP: directory, TMP: directory, USERPROFILE: directory, APPDATA: directory, LOCALAPPDATA: directory, XDG_CONFIG_HOME: directory, CONTROL_PLANE_API_KEY: runtimeKey };
     const child = spawn(binary, ['run', '--control-plane.base-url', planeUrl, '--control-plane.tunnel-id', tunnelId, '--control-plane.api-key', 'env:CONTROL_PLANE_API_KEY', '--control-plane.poll-timeout', '100ms', '--mcp.server-url', `${publicUrl}/mcp`, '--health.listen-addr', '127.0.0.1:0', '--health.url-file', healthFile, '--profile-dir', path.join(directory, 'profiles'), '--http-proxy', proxyUrl, '--open-web-ui=false', '--cloudflared.managed=false', '--log.level', 'warn', '--log.format', 'json'], { cwd: directory, env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
-    children.push(child); let output = ''; let spawnError: Error | undefined;
+    children.push(child);
+    childClosures.set(child, new Promise(resolve => { child.once('close', () => resolve()); }));
+    let output = ''; let spawnError: Error | undefined;
     child.stdout!.on('data', chunk => { output = (output + chunk).slice(-12_000); }); child.stderr!.on('data', chunk => { output = (output + chunk).slice(-12_000); });
     child.on('error', error => { spawnError = error; });
     const healthUrl = await until(() => {

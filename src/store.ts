@@ -2,10 +2,12 @@ import { randomUUID } from "node:crypto";
 import { chmodSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync, openSync, closeSync, fsyncSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { routingEvidenceSchema, type RoutingEvidence } from './model-routing.js';
 
 export const STATE_VERSION = 1;
 
 export type PersistedJob = {
+  routing?:RoutingEvidence;
   effective_config?: Record<string, unknown>;
   evidence_items?: Record<string, unknown>[];
   job_id: string;
@@ -67,6 +69,7 @@ function validJob(value: unknown): value is PersistedJob {
   if (!isObject(value)) return false;
   return (
     (value.effective_config === undefined || isObject(value.effective_config)) &&
+    (value.routing === undefined || routingEvidenceSchema.safeParse(value.routing).success && isObject(value.routing) && value.routing.job_id===value.job_id && value.routing.thread_id===value.thread_id && value.routing.turn_id===value.turn_id) &&
     (value.evidence_items === undefined || Array.isArray(value.evidence_items) && value.evidence_items.every(isObject)) &&
     typeof value.job_id === "string" && value.job_id.length > 0 &&
     (value.thread_id === null || typeof value.thread_id === "string" && value.thread_id.length > 0) &&

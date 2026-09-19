@@ -69,6 +69,36 @@ function fixture(t: { after: (cleanup: () => void) => void }) {
 
 const task = (request_key: string) => ({ request_key, project_id: "fixture", requirements: "將 value 改為 2，保留其他行為。", acceptance: ["value 等於 2", "執行既有測試並保留結果"] });
 
+test('independent repair review retains original acceptance, complete current source and cumulative changes',async t=>{
+  const f=fixture(t);writeFileSync(path.join(f.workspace,'dependency.ts'),'export const dependency = 42;\n');
+  const {result,manifest}=await finished(f,'independent');
+  const original=readAll(f.product,'real-client-boundary-fixture',manifest);
+  assert.match(original['source.json']!,/dependency = 42/);
+  await f.product.review('real-client-boundary-fixture',{request_key:'finding',job_id:result.job_id!,manifest_id:manifest.id,verdict:'changes_requested',summary:'The acceptance regression needs a substantive test.'});
+  const next=await f.product.continue({request_key:'repair',job_id:result.job_id!,requirements:'Add the missing regression test.',acceptance:['New regression passes.']});
+  f.fake.complete(next.thread_id!,next.turn_id!,f.workspace);
+  const current=f.product.seal(result.job_id!);const contents=readAll(f.product,'real-client-boundary-fixture',current);
+  assert.match(contents['cumulative.patch']!,/\+export const value = 2/);
+  assert.equal(contents['changes.patch'],'');
+  const requirements=JSON.parse(contents['requirements.json']!);
+  assert.ok(requirements.current_acceptance.includes('value 等於 2'));
+  assert.match(requirements.current_requirements,/substantive test/);
+  assert.equal(f.product.evidenceStore.read(manifest.id,'source.json').content,original['source.json']);
+  await assert.rejects(f.product.review('different-client',{request_key:'invalid-pass',job_id:result.job_id!,manifest_id:current.id,verdict:'pass',summary:'No receipt'}),/EVIDENCE_NOT_READ/);
+});
+
+test('three unsuccessful repair rounds stop before another dispatch or journal write',async t=>{
+  const f=fixture(t);const {result}=await finished(f,'repair-limit');
+  for(let attempt=0;attempt<4;attempt++){
+    const manifest=f.product.seal(result.job_id!);readAll(f.product,'fixture-reviewer',manifest);
+    await f.product.review('fixture-reviewer',{request_key:`verdict-${attempt}`,job_id:result.job_id!,manifest_id:manifest.id,verdict:'changes_requested',summary:'A substantive unresolved regression remains.'});
+    if(attempt<3){const next=await f.product.continue({request_key:`repair-${attempt}`,job_id:result.job_id!,requirements:'Fix the regression.',acceptance:['Regression passes.']});f.fake.complete(next.thread_id!,next.turn_id!,f.workspace);}
+  }
+  const count=f.product.journal.list().length;
+  await assert.rejects(f.product.continue({request_key:'over-limit',job_id:result.job_id!,requirements:'Repeat indefinitely.',acceptance:['Pass.']}),/repair limit/);
+  assert.equal(f.product.journal.list().length,count);assert.equal(f.fake.count('turn/start'),4);
+});
+
 async function finished(f: ReturnType<typeof fixture>, key = "start") {
   const result = await f.product.submit(task(key));
   writeFileSync(path.join(f.workspace, "source.ts"), "export const value = 2;\n");

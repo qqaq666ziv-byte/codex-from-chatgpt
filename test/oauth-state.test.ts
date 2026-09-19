@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { OAuthGate, OAuthError, type OAuthTokenResult } from '../src/oauth.js';
 import { EncryptedOAuthStateStore, OAuthStateError, windowsDpapiCipher, type OAuthStateCipher, type OAuthPersistentState } from '../src/oauth-state.js';
+import { OAUTH_LEGACY_GRANT_MS, OAUTH_LEGACY_MAX_ROTATIONS } from '../src/oauth-policy.js';
 
 const execute = promisify(execFile);
 const issuer = 'https://fixed-autodev.example';
@@ -72,6 +73,23 @@ function seal(f: ReturnType<typeof fixture>, state: unknown) {
   writeFileSync(f.filePath, JSON.stringify({ schemaVersion: 1, ciphertext: bytes.toString('base64'), checksum: hash(bytes) }));
 }
 
+
+// Reconstruct the original schema-1 opaque-token contract; no real state is read.
+function legacy(f: ReturnType<typeof fixture>, issued: ReturnType<typeof grant>) {
+  const state = unseal(f);
+  const existing = state.grants[0]!;
+  const expiresAt = f.time() + OAUTH_LEGACY_GRANT_MS;
+  state.schemaVersion = 1;
+  state.grants[0] = { id: existing.id, clientId: existing.clientId, expiresAt, rotations: 0 };
+  for (const entries of [state.refreshTokens, state.usedCodes, state.usedRefresh]) {
+    for (const [, ref] of entries) { ref.expiresAt = expiresAt; delete ref.generation; }
+  }
+  issued.tokens.refresh_token = randomBytes(32).toString('base64url');
+  state.refreshTokens[0]![0] = hash(issued.tokens.refresh_token);
+  seal(f, state);
+  return expiresAt;
+}
+
 test('fixed-issuer clients and grant identity survive restart; refresh replay durably revokes the entire family', () => {
   const f = fixture();
   const first = f.gate();
@@ -119,10 +137,15 @@ test('issuer, ciphertext, schema, client binding, rotation state and clock corru
   assert.deepEqual(readFileSync(f.filePath), original);
   const originalState = unseal(f);
   for (const mutate of [
-    (state: any) => { state.schemaVersion = 2; },
+    (state: any) => { state.schemaVersion = 3; },
+    (state: any) => { state.schemaVersion = 1; },
+    (state: any) => { delete state.grants[0].refreshKey; },
+    (state: any) => { state.grants[0].refreshKey = 'invalid'; },
+    (state: any) => { state.refreshTokens[0][1].generation += 1; },
+    (state: any) => { state.accessTokens[0][1].expiresAt = null; },
     (state: any) => { state.issuer = 'https://wrong.example'; },
     (state: any) => { state.grants[0].clientId = 'unknown'; },
-    (state: any) => { state.grants[0].expiresAt = state.writtenAt + 9 * 60 * 60_000; },
+    (state: any) => { state.grants[0].expiresAt = state.writtenAt + OAUTH_LEGACY_GRANT_MS + 1; },
     (state: any) => { state.grants[0].rotations = 64; },
     (state: any) => { state.accessTokens[0][1].expiresAt = state.writtenAt + 11 * 60_000; },
     (state: any) => { state.clients[0].redirects = ['https://evil.example/callback']; },
@@ -188,10 +211,41 @@ test('a stale store cannot overwrite a newer registration or issue tokens from a
   assert.throws(() => restarted.token(refresh(initial.clientId, initial.tokens)), oauthError('invalid_grant'));
 });
 
-test('absolute grant/access expiry and the refresh rotation limit survive process reconstruction', () => {
+test('upgrading the policy does not extend or revive an existing eight-hour grant', () => {
+  const f = fixture();
+  const issued = grant(f.gate());
+  const expiresAt = legacy(f, issued);
+  assert.equal(f.gate().verify(issued.tokens.access_token).client_id, issued.clientId);
+  assert.equal(unseal(f).grants[0]!.expiresAt, expiresAt);
+  f.advance(9 * 60 * 60_000);
+  assert.throws(() => f.gate().token(refresh(issued.clientId, issued.tokens)), oauthError('invalid_grant'));
+  assert.throws(() => f.gate().verify(issued.tokens.access_token), oauthError('invalid_token'));
+});
+
+test('daily restart retains the same grant beyond overnight and 64 ordinary refreshes', () => {
   const f = fixture();
   let gate = f.gate();
   const issued = grant(gate);
+  const identity = gate.verify(issued.tokens.access_token);
+  let tokens = issued.tokens;
+  for (let day = 0; day < 7; day++) {
+    f.advance(24 * 60 * 60_000);
+    gate = f.gate();
+    for (let refreshCount = 0; refreshCount < 12; refreshCount++) {
+      f.advance(10 * 60_000);
+      tokens = gate.token(refresh(issued.clientId, tokens));
+    }
+    assert.equal(gate.verify(tokens.access_token).grant_id, identity.grant_id);
+  }
+  assert.throws(() => f.gate().token(refresh(issued.clientId, issued.tokens)), oauthError('invalid_grant'));
+  assert.throws(() => f.gate().verify(tokens.access_token), oauthError('invalid_token'));
+});
+
+test('legacy absolute grant/access expiry and the refresh rotation limit survive process reconstruction', () => {
+  const f = fixture();
+  let gate = f.gate();
+  const issued = grant(gate);
+  legacy(f, issued);
   f.advance(10 * 60_000 + 1);
   gate = f.gate();
   assert.throws(() => gate.verify(issued.tokens.access_token), oauthError('invalid_token'));
@@ -201,7 +255,8 @@ test('absolute grant/access expiry and the refresh rotation limit survive proces
   assert.throws(() => gate.token(refresh(issued.clientId, tokens)), oauthError('invalid_grant'));
   assert.throws(() => f.gate().verify(tokens.access_token), oauthError('invalid_token'));
   const fresh = grant(f.gate(), issued.clientId);
-  f.advance(8 * 60 * 60_000 + 1);
+  legacy(f, fresh);
+  f.advance(OAUTH_LEGACY_GRANT_MS + 1);
   assert.throws(() => f.gate().token(refresh(issued.clientId, fresh.tokens)), oauthError('invalid_grant'));
   const afterExpiry = readFileSync(f.filePath);
   f.advance(-1);
@@ -283,3 +338,62 @@ process.stdout.write(JSON.stringify({identity,rotated}));
     }
   });
 }
+
+
+test('one consent survives years and more than 8192 refreshes with bounded persisted replay state', () => {
+  const f = fixture();
+  let gate = f.gate();
+  const issued = grant(gate);
+  const id = gate.verify(issued.tokens.access_token).grant_id;
+  let tokens = issued.tokens;
+  for (let index = 0; index < 8200; index++) {
+    f.advance(24 * 60 * 60_000);
+    if (index % 1000 === 0) gate = f.gate();
+    tokens = gate.token(refresh(issued.clientId, tokens));
+  }
+  gate = f.gate();
+  assert.equal(gate.verify(tokens.access_token).grant_id, id);
+  const state = unseal(f);
+  assert.equal(state.grants[0]!.expiresAt, null);
+  assert.equal(state.refreshTokens.length, 1);
+  assert.equal(state.usedRefresh.length, 0);
+  assert.ok(JSON.stringify(state).length < 4096);
+  assert.throws(() => gate.token(refresh(issued.clientId, issued.tokens)), oauthError('invalid_grant'));
+  assert.throws(() => f.gate().verify(tokens.access_token), oauthError('invalid_token'));
+});
+
+
+test('explicit local revocation survives restart and does not affect another authorization', () => {
+  const f = fixture();
+  const gate = f.gate();
+  const first = grant(gate);
+  const second = grant(gate, first.clientId);
+  const id = gate.verify(first.tokens.access_token).grant_id;
+  const otherId = gate.verify(second.tokens.access_token).grant_id;
+  assert.deepEqual(gate.authorizations().map(value => value.expires_at), [null, null]);
+  assert.deepEqual(gate.revokeAuthorization(id), { revoked: true, grant_id: id });
+  const restarted = f.gate();
+  assert.throws(() => restarted.verify(first.tokens.access_token), oauthError('invalid_token'));
+  assert.throws(() => restarted.token(refresh(first.clientId, first.tokens)), oauthError('invalid_grant'));
+  assert.equal(restarted.verify(second.tokens.access_token).grant_id, otherId);
+  assert.deepEqual(restarted.authorizations().map(value => value.grant_id), [otherId]);
+  assert.doesNotThrow(() => restarted.revokeAuthorization(id));
+});
+
+
+test('access capacity rejects refresh without consuming it and recovers after short tokens expire', () => {
+  const f = fixture();
+  const issued = grant(f.gate());
+  const state = unseal(f);
+  const [initial, ref] = state.accessTokens[0]!;
+  state.accessTokens = Array.from({ length: 4096 }, (_, index) => [index === 0 ? initial : hash('synthetic-access-' + index), { ...ref }]);
+  seal(f, state);
+  const gate = f.gate();
+  const before = readFileSync(f.filePath);
+  assert.throws(() => gate.token(refresh(issued.clientId, issued.tokens)), oauthError('temporarily_unavailable'));
+  assert.deepEqual(readFileSync(f.filePath), before);
+  assert.doesNotThrow(() => gate.verify(issued.tokens.access_token));
+  f.advance(10 * 60_000);
+  const restarted = f.gate();
+  assert.equal(restarted.verify(restarted.token(refresh(issued.clientId, issued.tokens)).access_token).client_id, issued.clientId);
+});
