@@ -1,5 +1,7 @@
 # Scoped review 暫停交接 — 2026-09-20
 
+> 下列暫停狀態保留作為歷史紀錄。接續後的最終型別檢查、54 項 focused tests 和 build 均已通過；安裝與正式 MCP 結果見本 PR 的交付紀錄。
+
 依使用者要求先停在可恢復段落。本修改尚未安裝到正在使用的 AutoDev，原服務保持運行，沒有重啟或 OAuth 變更。
 
 ## 已保存
@@ -14,6 +16,7 @@
 - `npm.cmd run typecheck` 與 `node --import tsx --test test/review-scope.test.ts test/snapshot.test.ts test/product.test.ts`：初版 35/35 通過、退出碼 0。
 - 之後補強 scope 理由的 token redaction、明確 glob 測試值、skill/文件；暫停前未重跑最終版 focused tests，不宣稱最終版完整通過。
 - `npm.cmd run check`：型別階段通過，測試階段由使用者要求暫停。只停止當次已核對父子關係、命令和建立時間的 14 個 test 程序。全套未完成，沒有 build 或全套 PASS 聲明。
+- 接續後執行 `npm.cmd run typecheck`、`node --import tsx --test test/review-scope.test.ts test/snapshot.test.ts test/product.test.ts test/planner-input.test.ts test/routing-integration.test.ts`、`npm.cmd run build`，全部 exit 0，54/54 tests 通過。範圍涵蓋新 scope 判斷、snapshot、產品審查、header 與 routing 整合；未重跑不受影響的 Windows launcher 完整測試。唯讀獨立程式審查未發現確證阻擋。
 - 本機輸出保存於隔離 worktree 的 `.local-tests/review-scope-check.log`，程序停止清單是 `.local-tests/review-scope-stopped-processes.json`；均 ignored，不上傳私密 runtime 或原始輸出。
 - 固定 lockfile 的 `npm ci --ignore-scripts` 成功。`npm audit` 發現既有 4 項公告（fast-uri high；hono、qs moderate；diff low），本次未更新依賴。不要將此敘述當成新增漏洞或 0 漏洞聲明。
 
