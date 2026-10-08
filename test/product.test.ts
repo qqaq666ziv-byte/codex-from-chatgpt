@@ -475,7 +475,7 @@ test('change-scoped review excludes only pinned unchanged binaries, survives res
   const contents=readAll(restarted,'reviewer',manifest);
   assert.equal(JSON.stringify(contents).includes(fakeToken),false);
   const scope=JSON.parse(contents['review-scope.json']!);
-  assert.equal(scope.declaration.mode,'changes');assert.equal(scope.excluded[0].path,'icon.png');assert.match(scope.excluded[0].sha256,/^[a-f0-9]{64}$/);assert.equal(scope.excluded[0].git_mode,'100644');assert.equal(scope.excluded[0].working_mode,'100644');
+  assert.equal(scope.declaration.mode,'changes');assert.equal(scope.excluded[0].path,'icon.png');assert.match(scope.excluded[0].sha256,/^[a-f0-9]{64}$/);assert.equal(scope.excluded[0].git_mode,'100644');assert.equal(scope.excluded[0].working_mode,'100644');assert.match(scope.excluded[0].git_blob_oid,/^[a-f0-9]{40,64}$/);
   assert.equal((await restarted.review('reviewer',reviewInput(result.job_id!,manifest,'scoped-pass'))).review_status,'pass');
   assert.equal(new AutoDev(f.config,f.manager).status(result.job_id!).review_status,'pass');
   writeFileSync(path.join(f.workspace,'icon.png'),Buffer.from([0,1,2,4]));
@@ -498,6 +498,16 @@ test('Git mode-only change to an excluded binary prevents review pass',async t=>
   f.fake.complete(result.thread_id!,result.turn_id!,f.workspace);
   const manifest=f.product.seal(result.job_id!);readAll(f.product,'git-mode-reviewer',manifest);
   await assert.rejects(f.product.review('git-mode-reviewer',reviewInput(result.job_id!,manifest,'reject-git-mode-change')),/changed|separate review/i);
+});
+
+test('staged binary blob changed after scope capture blocks pass when worktree bytes are restored',async t=>{
+  const f=fixture(t);const result=await f.product.submit(scopedBinaryTask(f,'staged-after-capture'));
+  writeFileSync(path.join(f.workspace,'icon.png'),Buffer.from([0,9]));
+  execFileSync('git',['add','icon.png'],{cwd:f.workspace,windowsHide:true});
+  writeFileSync(path.join(f.workspace,'icon.png'),Buffer.from([0,1,2,3]));
+  f.fake.complete(result.thread_id!,result.turn_id!,f.workspace);
+  const manifest=f.product.seal(result.job_id!);readAll(f.product,'staged-reviewer',manifest);
+  await assert.rejects(f.product.review('staged-reviewer',reviewInput(result.job_id!,manifest,'reject-staged-after-capture')),/changed|separate review/i);
 });
 
 test('first trusted change scope can bind on followup when excluded binaries match the initial snapshot',async t=>{
@@ -574,6 +584,30 @@ test('binary modified before dispatch cannot hide behind the current task baseli
   const f=fixture(t);const input=scopedBinaryTask(f,'preexisting-binary-change');
   writeFileSync(path.join(f.workspace,'icon.png'),Buffer.from([0,9]));
   await assert.rejects(f.product.submit(input),/changed from base_commit|outcome/i);
+  assert.equal(f.fake.count('turn/start'),0);
+});
+
+test('staged binary blob cannot be hidden by restoring its worktree bytes before scope capture',async t=>{
+  const f=fixture(t);const input=scopedBinaryTask(f,'staged-restored-binary');
+  writeFileSync(path.join(f.workspace,'icon.png'),Buffer.from([0,9]));
+  execFileSync('git',['add','icon.png'],{cwd:f.workspace,windowsHide:true});
+  writeFileSync(path.join(f.workspace,'icon.png'),Buffer.from([0,1,2,3]));
+  await assert.rejects(f.product.submit(input),/changed from base_commit|staged blob|outcome/i);
+  assert.equal(f.fake.count('turn/start'),0);
+});
+
+test('unmerged binary index without stage zero cannot be excluded',async t=>{
+  const f=fixture(t);const input=scopedBinaryTask(f,'unmerged-binary-index');
+  execFileSync('git',['checkout','-b','binary-side'],{cwd:f.workspace,windowsHide:true,stdio:'pipe'});
+  writeFileSync(path.join(f.workspace,'icon.png'),Buffer.from([0,5,6]));
+  execFileSync('git',['add','icon.png'],{cwd:f.workspace,windowsHide:true});
+  execFileSync('git',['-c','user.name=Fixture','-c','user.email=fixture@example.invalid','-c','core.hooksPath=.no-test-hooks','commit','-m','Binary side change'],{cwd:f.workspace,windowsHide:true,stdio:'pipe'});
+  execFileSync('git',['checkout','-'],{cwd:f.workspace,windowsHide:true,stdio:'pipe'});
+  writeFileSync(path.join(f.workspace,'icon.png'),Buffer.from([0,7,8]));
+  execFileSync('git',['add','icon.png'],{cwd:f.workspace,windowsHide:true});
+  execFileSync('git',['-c','user.name=Fixture','-c','user.email=fixture@example.invalid','-c','core.hooksPath=.no-test-hooks','commit','-m','Binary main change'],{cwd:f.workspace,windowsHide:true,stdio:'pipe'});
+  assert.throws(()=>execFileSync('git',['merge','binary-side'],{cwd:f.workspace,windowsHide:true,stdio:'pipe'}));
+  await assert.rejects(f.product.submit(input),/stage-0|mode evidence|outcome/i);
   assert.equal(f.fake.count('turn/start'),0);
 });
 

@@ -7,7 +7,7 @@ import { redactSensitiveText } from './evidence.js';
 
 export type GitFileMode='100644'|'100755';
 /** `mode` is observed on disk; `git_mode` is the mode recorded in the index. */
-export type SourceSnapshot={head:string|null;files:Record<string,{sha256:string;content:string}>;omitted:Array<{path:string;reason:string;sha256?:string;bytes?:number;mode?:GitFileMode;git_mode?:GitFileMode}>};
+export type SourceSnapshot={head:string|null;files:Record<string,{sha256:string;content:string}>;omitted:Array<{path:string;reason:string;sha256?:string;bytes?:number;mode?:GitFileMode;git_mode?:GitFileMode;git_oid?:string}>};
 const sha=(value:string|Buffer)=>createHash('sha256').update(value).digest('hex');
 const fileMode=(mode:number):GitFileMode=>(mode&0o111)?'100755':'100644';
 function git(cwd:string,args:string[]):string { return execFileSync('git',['--no-optional-locks',...args],{cwd,windowsHide:true,encoding:'utf8',maxBuffer:8*1024*1024,stdio:['ignore','pipe','pipe']}); }
@@ -15,7 +15,7 @@ export const sensitivePath=/(^|\/)(\.env(?:\..*)?|\.git|\.runtime|\.local-tests|
 export function snapshotSource(workspace:string,allowUnversioned=false):SourceSnapshot {
   const root=realpathSync(workspace);
   const files:SourceSnapshot['files']={}; const omitted:SourceSnapshot['omitted']=[]; let bytes=0;
-  let head:string|null=null;let names:string[];const gitModes=new Map<string,GitFileMode>();
+  let head:string|null=null;let names:string[];const gitIndex=new Map<string,{mode:GitFileMode;oid:string}>();
   if(allowUnversioned&&!existsSync(path.join(root,'.git'))){
     names=[];let entries=0;
     const walk=(directory:string,depth:number)=>{
@@ -36,10 +36,15 @@ export function snapshotSource(workspace:string,allowUnversioned=false):SourceSn
     const top=realpathSync(git(root,['rev-parse','--show-toplevel']).trim());
     if (top.toLowerCase()!==root.toLowerCase()) throw new Error('Register the Git repository root, not a subfolder.');
     try {head=git(root,['rev-parse','--verify','HEAD']).trim();} catch { /* empty repository */ }
+    const stagedEntries=new Map<string,Array<{mode:string;oid:string;stage:string}>>();
     for(const entry of git(root,['ls-files','--stage','-z']).split('\0')){
       const tab=entry.indexOf('\t');if(tab<0)continue;
-      const [mode,,stage]=entry.slice(0,tab).split(' ');const name=entry.slice(tab+1);
-      if(name&&stage==='0'&&(mode==='100644'||mode==='100755'))gitModes.set(name,mode);
+      const [mode,oid,stage]=entry.slice(0,tab).split(' ');const name=entry.slice(tab+1);
+      if(name&&mode&&oid&&stage){const items=stagedEntries.get(name)??[];items.push({mode,oid,stage});stagedEntries.set(name,items);}
+    }
+    for(const [name,entries] of stagedEntries){
+      const item=entries[0]!;
+      if(entries.length===1&&item.stage==='0'&&(item.mode==='100644'||item.mode==='100755')&&/^[a-f0-9]{40,64}$/.test(item.oid))gitIndex.set(name,{mode:item.mode,oid:item.oid});
     }
     names=[...new Set(git(root,['ls-files','--cached','--others','--exclude-standard','-z']).split('\0').filter(Boolean))].sort();
   }
@@ -52,9 +57,9 @@ export function snapshotSource(workspace:string,allowUnversioned=false):SourceSn
     const canonical=realpathSync(file); if(canonical!==file && (process.platform!=='win32'||canonical.toLowerCase()!==file.toLowerCase())) throw new Error('Source path resolves through a link; evidence capture refused.');
     bytes+=stat.size; if(stat.size>2*1024*1024||bytes>32*1024*1024) throw new Error('Source evidence exceeds 2 MiB/file or 32 MiB/project limit; narrow the registered repository.');
     const raw=readFileSync(file);
-    const mode=fileMode(stat.mode);const git_mode=gitModes.get(name);
-    if(raw.includes(0)) {omitted.push({path:name,reason:'binary_requires_separate_review',sha256:sha(raw),bytes:raw.length,mode,...(git_mode?{git_mode}:{})});continue;}
-    const text=raw.toString('utf8'); if(!Buffer.from(text).equals(raw)) {omitted.push({path:name,reason:'non_utf8_requires_separate_review',sha256:sha(raw),bytes:raw.length,mode,...(git_mode?{git_mode}:{})});continue;}
+    const mode=fileMode(stat.mode);const index=gitIndex.get(name);
+    if(raw.includes(0)) {omitted.push({path:name,reason:'binary_requires_separate_review',sha256:sha(raw),bytes:raw.length,mode,...(index?{git_mode:index.mode,git_oid:index.oid}:{})});continue;}
+    const text=raw.toString('utf8'); if(!Buffer.from(text).equals(raw)) {omitted.push({path:name,reason:'non_utf8_requires_separate_review',sha256:sha(raw),bytes:raw.length,mode,...(index?{git_mode:index.mode,git_oid:index.oid}:{})});continue;}
     const content=redactSensitiveText(text);
     if(content!==text) omitted.push({path:name,reason:'known_token_patterns_redacted'});
     files[name]={sha256:sha(raw),content};

@@ -11,7 +11,7 @@ export const reviewScopeSchema=z.discriminatedUnion('mode',[
   z.object({mode:z.literal('changes'),base_commit:z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/),excluded_binary_assets:z.array(asset).max(200),required_binary_paths:z.array(relativePath).max(200)}).strict(),
 ]);
 export type ReviewScope=z.infer<typeof reviewScopeSchema>;
-export const scopeEvidenceSchema=z.object({declaration:reviewScopeSchema,excluded:z.array(asset.extend({sha256:z.string().regex(/^[a-f0-9]{64}$/),bytes:z.number().int().nonnegative(),git_mode:z.enum(['100644','100755']).optional(),working_mode:z.enum(['100644','100755']).optional()}))}).strict();
+export const scopeEvidenceSchema=z.object({declaration:reviewScopeSchema,excluded:z.array(asset.extend({sha256:z.string().regex(/^[a-f0-9]{64}$/),bytes:z.number().int().nonnegative(),git_mode:z.enum(['100644','100755']).optional(),working_mode:z.enum(['100644','100755']).optional(),git_blob_oid:z.string().regex(/^[a-f0-9]{40,64}$/).optional()}))}).strict();
 export type ScopeEvidence=z.infer<typeof scopeEvidenceSchema>;
 
 /** Explicit leading control records only; never infer review scope from prose or repository content. */
@@ -46,19 +46,23 @@ export function captureReviewScope(workspace:string,declaration:ReviewScope|unde
     if(paths.has(item.path)||declaration.required_binary_paths.includes(item.path))throw new Error('A binary exclusion is duplicated or is a required dependency.');
     paths.add(item.path);
     const current=before.omitted.find(entry=>entry.path===item.path);
-    if(current?.reason!=='binary_requires_separate_review'||!current.sha256||current.bytes===undefined||!current.mode||!current.git_mode)throw new Error(`Binary exclusion lacks current hashed binary and Git mode evidence: ${item.path}`);
-    let raw:Buffer;
+    if(current?.reason!=='binary_requires_separate_review'||!current.sha256||current.bytes===undefined||!current.mode||!current.git_mode||!current.git_oid)throw new Error(`Binary exclusion lacks current hashed binary, Git mode, or stage-0 blob evidence: ${item.path}`);
+    let raw:Buffer;let staged:Buffer;
     let gitMode:GitFileMode;
+    let gitBlobOid:string;
     try{
       const tree=git(workspace,['ls-tree','-z',base,'--',item.path]).toString('utf8');
       const entry=/^(100644|100755) blob ([a-f0-9]{40,64})\t([^\0]+)\0$/.exec(tree);
       if(!entry||entry[3]!==item.path)throw new Error();
       gitMode=entry[1] as GitFileMode;
-      raw=git(workspace,['cat-file','blob',entry[2]!]);
+      gitBlobOid=entry[2]!;
+      raw=git(workspace,['cat-file','blob',gitBlobOid]);
+      staged=git(workspace,['cat-file','blob',current.git_oid]);
     }catch{throw new Error(`Binary exclusion is not a regular tracked file at base_commit: ${item.path}`);}
     const sha256=createHash('sha256').update(raw).digest('hex');
-    if(!raw.includes(0)||sha256!==current.sha256||raw.length!==current.bytes||gitMode!==current.git_mode||(process.platform!=='win32'&&gitMode!==current.mode))throw new Error(`Binary exclusion content or mode changed from base_commit: ${item.path}`);
-    return {...item,sha256,bytes:raw.length,git_mode:gitMode,working_mode:current.mode};
+    const stagedSha256=createHash('sha256').update(staged).digest('hex');
+    if(!raw.includes(0)||!staged.includes(0)||sha256!==current.sha256||raw.length!==current.bytes||stagedSha256!==sha256||staged.length!==raw.length||current.git_oid!==gitBlobOid||gitMode!==current.git_mode||(process.platform!=='win32'&&gitMode!==current.mode))throw new Error(`Binary exclusion content, stage-0 blob, or mode changed from base_commit: ${item.path}`);
+    return {...item,sha256,bytes:raw.length,git_mode:gitMode,working_mode:current.mode,git_blob_oid:gitBlobOid};
   });
   return {declaration,excluded};
 }
@@ -67,7 +71,7 @@ export function captureReviewScope(workspace:string,declaration:ReviewScope|unde
 export function assertScopeMatchesInitialSnapshot(scope:ScopeEvidence,initial:SourceSnapshot):void {
   for(const item of scope.excluded){
     const captured=initial.omitted.find(entry=>entry.path===item.path);
-    if(captured?.reason!=='binary_requires_separate_review'||!captured.sha256||captured.bytes===undefined||!captured.mode||!captured.git_mode||captured.sha256!==item.sha256||captured.bytes!==item.bytes||captured.mode!==item.working_mode||captured.git_mode!==item.git_mode)
+    if(captured?.reason!=='binary_requires_separate_review'||!captured.sha256||captured.bytes===undefined||!captured.mode||!captured.git_mode||!captured.git_oid||captured.sha256!==item.sha256||captured.bytes!==item.bytes||captured.mode!==item.working_mode||captured.git_mode!==item.git_mode||captured.git_oid!==item.git_blob_oid)
       throw new Error(`Binary exclusion changed since the initial baseline or lacks immutable evidence: ${item.path}`);
   }
 }
@@ -80,7 +84,7 @@ export function assertReviewableOmissions(before:SourceSnapshot,after:SourceSnap
   for(const item of exclusions.values()){
     for(const source of [before,after]){
       const captured=source.omitted.find(entry=>entry.path===item.path);
-      if(captured?.reason!=='binary_requires_separate_review'||captured.sha256!==item.sha256||captured.bytes!==item.bytes||!item.git_mode||!item.working_mode||captured.mode!==item.working_mode||captured.git_mode!==item.git_mode)
+      if(captured?.reason!=='binary_requires_separate_review'||captured.sha256!==item.sha256||captured.bytes!==item.bytes||!item.git_mode||!item.working_mode||!item.git_blob_oid||captured.mode!==item.working_mode||captured.git_mode!==item.git_mode||captured.git_oid!==item.git_blob_oid)
         throw new Error(`Excluded binary content or mode changed, disappeared or lacks immutable evidence: ${item.path}`);
     }
   }
