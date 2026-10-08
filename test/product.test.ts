@@ -463,6 +463,14 @@ function scopedBinaryTask(f:ReturnType<typeof fixture>,request_key:string) {
   return {...task(request_key),requirements:`AutoDev-Review-Scope: ${JSON.stringify({mode:'changes',base_commit:base,excluded_binary_assets:[{path:'icon.png',reason:'Unchanged application icon unrelated to this calculation change.'}],required_binary_paths:[]})}\n${task(request_key).requirements}`};
 }
 
+function scopedBinaryModeTask(f:ReturnType<typeof fixture>,request_key:string,mode:number) {
+  const binary=path.join(f.workspace,'icon.png');writeFileSync(binary,Buffer.from([0,1,2,3]));chmodSync(binary,mode);
+  execFileSync('git',['add','.'],{cwd:f.workspace,windowsHide:true});
+  execFileSync('git',['-c','user.name=Fixture','-c','user.email=fixture@example.invalid','-c','core.hooksPath=.no-test-hooks','commit','-m','Fixture mode baseline'],{cwd:f.workspace,windowsHide:true,stdio:'pipe'});
+  const base=execFileSync('git',['rev-parse','HEAD'],{cwd:f.workspace,windowsHide:true,encoding:'utf8'}).trim();
+  return {...task(request_key),requirements:`AutoDev-Review-Scope: ${JSON.stringify({mode:'changes',base_commit:base,excluded_binary_assets:[{path:'icon.png',reason:'Unchanged application icon unrelated to this calculation change.'}],required_binary_paths:[]})}\n${task(request_key).requirements}`};
+}
+
 test('change-scoped review excludes only pinned unchanged binaries, survives restart and becomes stale after asset mutation',async t=>{
   const f=fixture(t);const input=scopedBinaryTask(f,'scoped-unchanged');
   const fakeToken=`sk-${'C'.repeat(26)}`;
@@ -490,6 +498,17 @@ test('chmod-only change to an excluded binary prevents review pass',async t=>{
   f.fake.complete(result.thread_id!,result.turn_id!,f.workspace);
   const manifest=f.product.seal(result.job_id!);readAll(f.product,'mode-reviewer',manifest);
   await assert.rejects(f.product.review('mode-reviewer',reviewInput(result.job_id!,manifest,'reject-mode-change')),/changed|separate review/i);
+});
+
+test('Git executable mode follows owner-execute at both permission boundaries',async t=>{
+  if(process.platform==='win32'){t.skip('Windows does not expose Git executable-mode changes through chmod consistently.');return;}
+  for(const [initialMode,changedMode,label] of [[0o755,0o655,'owner execute removed despite other execute bits'],[0o655,0o755,'owner execute added despite other execute bits']] as const){
+    const f=fixture(t);const result=await f.product.submit(scopedBinaryModeTask(f,`mode-boundary-${label}`,initialMode));
+    chmodSync(path.join(f.workspace,'icon.png'),changedMode);
+    f.fake.complete(result.thread_id!,result.turn_id!,f.workspace);
+    const manifest=f.product.seal(result.job_id!);readAll(f.product,`mode-reviewer-${label}`,manifest);
+    await assert.rejects(f.product.review(`mode-reviewer-${label}`,reviewInput(result.job_id!,manifest,`reject-mode-boundary-${label}`)),/changed|separate review/i);
+  }
 });
 
 test('Git mode-only change to an excluded binary prevents review pass',async t=>{

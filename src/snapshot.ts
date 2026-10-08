@@ -9,7 +9,7 @@ export type GitFileMode='100644'|'100755';
 /** `mode` is observed on disk; `git_mode` is the mode recorded in the index. */
 export type SourceSnapshot={head:string|null;files:Record<string,{sha256:string;content:string}>;omitted:Array<{path:string;reason:string;sha256?:string;bytes?:number;mode?:GitFileMode;git_mode?:GitFileMode;git_oid?:string}>};
 const sha=(value:string|Buffer)=>createHash('sha256').update(value).digest('hex');
-const fileMode=(mode:number):GitFileMode=>(mode&0o111)?'100755':'100644';
+const fileMode=(mode:number):GitFileMode=>(mode&0o100)?'100755':'100644';
 function git(cwd:string,args:string[]):string { return execFileSync('git',['--no-optional-locks',...args],{cwd,windowsHide:true,encoding:'utf8',maxBuffer:8*1024*1024,stdio:['ignore','pipe','pipe']}); }
 export const sensitivePath=/(^|\/)(\.env(?:\..*)?|\.git|\.runtime|\.local-tests|\.ai-bridge|\.npmrc|\.netrc|\.pypirc|\.ssh|\.aws|\.kube|auth\.json|credentials?(?:\..*)?|.*\.pem|.*\.key|client-token|admin-token)(\/|$)/i;
 export function snapshotSource(workspace:string,allowUnversioned=false):SourceSnapshot {
