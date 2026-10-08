@@ -1,4 +1,4 @@
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { sensitivePath, type GitFileMode, type SourceSnapshot } from './snapshot.js';
@@ -13,6 +13,11 @@ export const reviewScopeSchema=z.discriminatedUnion('mode',[
 export type ReviewScope=z.infer<typeof reviewScopeSchema>;
 export const scopeEvidenceSchema=z.object({declaration:reviewScopeSchema,excluded:z.array(asset.extend({sha256:z.string().regex(/^[a-f0-9]{64}$/),bytes:z.number().int().nonnegative(),git_mode:z.enum(['100644','100755']).optional(),working_mode:z.enum(['100644','100755']).optional(),git_blob_oid:z.string().regex(/^[a-f0-9]{40,64}$/).optional()}))}).strict();
 export type ScopeEvidence=z.infer<typeof scopeEvidenceSchema>;
+
+/** A validated scope cannot be applied to this source; no task effect has occurred. */
+export class ReviewScopeValidationError extends Error {
+  constructor(message:string){super(message);this.name='ReviewScopeValidationError';}
+}
 
 /** Explicit leading control records only; never infer review scope from prose or repository content. */
 export function parseReviewScope(requirements:string):ReviewScope|undefined {
@@ -37,31 +42,31 @@ export function captureReviewScope(workspace:string,declaration:ReviewScope|unde
   if(!declaration)return undefined; // Legacy evidence remains strict; missing hashes are never inferred.
   if(declaration.mode==='full')return {declaration,excluded:[]};
   const base=declaration.base_commit;
-  try {
-    if(git(workspace,['rev-parse','--verify',`${base}^{commit}`]).toString('utf8').trim()!==base)throw new Error();
-    git(workspace,['merge-base','--is-ancestor',base,'HEAD']);
-  }catch{throw new Error('Review scope base_commit must identify an existing full commit SHA in the current HEAD ancestry.');}
+  if(git(workspace,['rev-parse','--verify',`${base}^{commit}`]).toString('utf8').trim()!==base)
+    throw new ReviewScopeValidationError('Review scope base_commit must identify an existing full commit SHA in the current HEAD ancestry.');
+  const ancestry=spawnSync('git',['--no-optional-locks','merge-base','--is-ancestor',base,'HEAD'],{cwd:workspace,windowsHide:true,encoding:'utf8',stdio:['ignore','pipe','pipe']});
+  if(ancestry.error)throw ancestry.error;
+  if(ancestry.status===1)throw new ReviewScopeValidationError('Review scope base_commit must identify an existing full commit SHA in the current HEAD ancestry.');
+  if(ancestry.status!==0)throw new Error('Could not verify review scope base_commit ancestry.');
   const paths=new Set<string>();
   const excluded=declaration.excluded_binary_assets.map(item=>{
-    if(paths.has(item.path)||declaration.required_binary_paths.includes(item.path))throw new Error('A binary exclusion is duplicated or is a required dependency.');
+    if(paths.has(item.path)||declaration.required_binary_paths.includes(item.path))throw new ReviewScopeValidationError('A binary exclusion is duplicated or is a required dependency.');
     paths.add(item.path);
     const current=before.omitted.find(entry=>entry.path===item.path);
-    if(current?.reason!=='binary_requires_separate_review'||!current.sha256||current.bytes===undefined||!current.mode||!current.git_mode||!current.git_oid)throw new Error(`Binary exclusion lacks current hashed binary, Git mode, or stage-0 blob evidence: ${item.path}`);
+    if(current?.reason!=='binary_requires_separate_review'||!current.sha256||current.bytes===undefined||!current.mode||!current.git_mode||!current.git_oid)throw new ReviewScopeValidationError(`Binary exclusion lacks current hashed binary, Git mode, or stage-0 blob evidence: ${item.path}`);
     let raw:Buffer;let staged:Buffer;
     let gitMode:GitFileMode;
     let gitBlobOid:string;
-    try{
-      const tree=git(workspace,['ls-tree','-z',base,'--',item.path]).toString('utf8');
-      const entry=/^(100644|100755) blob ([a-f0-9]{40,64})\t([^\0]+)\0$/.exec(tree);
-      if(!entry||entry[3]!==item.path)throw new Error();
-      gitMode=entry[1] as GitFileMode;
-      gitBlobOid=entry[2]!;
-      raw=git(workspace,['cat-file','blob',gitBlobOid]);
-      staged=git(workspace,['cat-file','blob',current.git_oid]);
-    }catch{throw new Error(`Binary exclusion is not a regular tracked file at base_commit: ${item.path}`);}
+    const tree=git(workspace,['ls-tree','-z',base,'--',item.path]).toString('utf8');
+    const entry=/^(100644|100755) blob ([a-f0-9]{40,64})\t([^\0]+)\0$/.exec(tree);
+    if(!entry||entry[3]!==item.path)throw new ReviewScopeValidationError(`Binary exclusion is not a regular tracked file at base_commit: ${item.path}`);
+    gitMode=entry[1] as GitFileMode;
+    gitBlobOid=entry[2]!;
+    raw=git(workspace,['cat-file','blob',gitBlobOid]);
+    staged=git(workspace,['cat-file','blob',current.git_oid]);
     const sha256=createHash('sha256').update(raw).digest('hex');
     const stagedSha256=createHash('sha256').update(staged).digest('hex');
-    if(!raw.includes(0)||!staged.includes(0)||sha256!==current.sha256||raw.length!==current.bytes||stagedSha256!==sha256||staged.length!==raw.length||current.git_oid!==gitBlobOid||gitMode!==current.git_mode||(process.platform!=='win32'&&gitMode!==current.mode))throw new Error(`Binary exclusion content, stage-0 blob, or mode changed from base_commit: ${item.path}`);
+    if(!raw.includes(0)||!staged.includes(0)||sha256!==current.sha256||raw.length!==current.bytes||stagedSha256!==sha256||staged.length!==raw.length||current.git_oid!==gitBlobOid||gitMode!==current.git_mode||(process.platform!=='win32'&&gitMode!==current.mode))throw new ReviewScopeValidationError(`Binary exclusion content, stage-0 blob, or mode changed from base_commit: ${item.path}`);
     return {...item,sha256,bytes:raw.length,git_mode:gitMode,working_mode:current.mode,git_blob_oid:gitBlobOid};
   });
   return {declaration,excluded};
@@ -72,7 +77,7 @@ export function assertScopeMatchesInitialSnapshot(scope:ScopeEvidence,initial:So
   for(const item of scope.excluded){
     const captured=initial.omitted.find(entry=>entry.path===item.path);
     if(captured?.reason!=='binary_requires_separate_review'||!captured.sha256||captured.bytes===undefined||!captured.mode||!captured.git_mode||!captured.git_oid||captured.sha256!==item.sha256||captured.bytes!==item.bytes||captured.mode!==item.working_mode||captured.git_mode!==item.git_mode||captured.git_oid!==item.git_blob_oid)
-      throw new Error(`Binary exclusion changed since the initial baseline or lacks immutable evidence: ${item.path}`);
+      throw new ReviewScopeValidationError(`Binary exclusion changed since the initial baseline or lacks immutable evidence: ${item.path}`);
   }
 }
 

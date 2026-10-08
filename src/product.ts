@@ -11,7 +11,7 @@ import { snapshotSource, sourceDiff, type SourceSnapshot } from './snapshot.js';
 import { redactValue } from './redaction.js';
 import { ModelRouter, routingDecisionSchema, routingRequestSchema, classifyRoutingError, type RoutingRequest, type RoutingDecision } from './model-routing.js';
 import { ProjectRegistry, type CreateProjectInput } from './project-registry.js';
-import { parseReviewScope, captureReviewScope, assertScopeMatchesInitialSnapshot, assertReviewableOmissions, scopeEvidenceSchema } from './review-scope.js';
+import { parseReviewScope, captureReviewScope, assertScopeMatchesInitialSnapshot, assertReviewableOmissions, scopeEvidenceSchema, ReviewScopeValidationError } from './review-scope.js';
 
 const hash=(text:string)=>createHash('sha256').update(text).digest('hex');
 const sourceSchema=z.object({head:z.string().nullable(),files:z.record(z.string(),z.object({sha256:z.string(),content:z.string()})),omitted:z.array(z.object({path:z.string(),reason:z.string(),sha256:z.string().optional(),bytes:z.number().int().nonnegative().optional(),mode:z.enum(['100644','100755']).optional(),git_mode:z.enum(['100644','100755']).optional(),git_oid:z.string().regex(/^[a-f0-9]{40,64}$/).optional()}))});
@@ -123,7 +123,7 @@ export class AutoDev {
     let reviewScope:Round['reviewScope'];
     if(baseline?.reviewScope){
       if(declaredScope&&JSON.stringify(declaredScope)!==JSON.stringify(baseline.reviewScope.declaration))
-        throw new Error('A continued review cannot change the original pinned review scope.');
+        throw new ReviewScopeValidationError('A continued review cannot change the original pinned review scope.');
       reviewScope=baseline.reviewScope;
     }else if(baseline&&declaredScope){
       reviewScope=captureReviewScope(workspace,declaredScope,before);
@@ -140,7 +140,9 @@ export class AutoDev {
     if(this.router&&(!input.routing?.model||!input.routing?.effort))await this.requireSelection(input.request_key,input.routing);
     return this.execute(input.request_key,{operation:'submit',...input},async()=>{
       await this.assertExecutorIdle();
-      const jobId=randomUUID(); const round=this.newRound(input.requirements,input.acceptance,project.path);
+      const jobId=randomUUID();let round:Round;
+      try{round=this.newRound(input.requirements,input.acceptance,project.path);}
+      catch(error){if(error instanceof ReviewScopeValidationError)throw new JournalDefinitiveError();throw error;}
       const decision=await this.router?.select(input.routing);
       if(input.routing&&!this.router)throw new Error('Routing requires the configured local model catalog.');
       if(decision)round.routingDecision=decision;
@@ -167,7 +169,9 @@ export class AutoDev {
       const previous=this.current(input.job_id);
       const repairing=previous.review.status==='changes_requested';
       const requirements=repairing?`${input.requirements}\n\nOriginal task (preserve its scope):\n${record.rounds[0]!.requirements}\n\nIndependent reviewer findings (validate each finding before repairing; explain any rejected finding with evidence):\n${previous.review.summary??''}`:input.requirements;
-      const round=this.newRound(requirements,repairing?[...new Set([...record.rounds[0]!.acceptance,...input.acceptance])]:input.acceptance,this.project(record.projectId).path,record.rounds[0]);
+      let round:Round;
+      try{round=this.newRound(requirements,repairing?[...new Set([...record.rounds[0]!.acceptance,...input.acceptance])]:input.acceptance,this.project(record.projectId).path,record.rounds[0]);}
+      catch(error){if(error instanceof ReviewScopeValidationError)throw new JournalDefinitiveError();throw error;}
       this.seal(input.job_id);
       if(!record.rounds[0]!.reviewScope&&round.reviewScope)record.rounds[0]!.reviewScope=round.reviewScope;
       if(decision)round.routingDecision=decision;

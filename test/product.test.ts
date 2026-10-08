@@ -107,6 +107,16 @@ async function finished(f: ReturnType<typeof fixture>, key = "start") {
   return { result, manifest: f.product.seal(result.job_id!) };
 }
 
+async function assertScopeSubmitJournalState(f:ReturnType<typeof fixture>,input:ReturnType<typeof scopedBinaryTask>,expected:'UNCERTAIN'|'FAILED'){
+  const matches=(code:'UNCERTAIN'|'FAILED'|'CONFLICT')=>(error:unknown)=>error instanceof JournalError&&error.code===code;
+  await assert.rejects(f.product.submit(input),matches(expected));
+  assert.equal(f.product.journal.list().find(record=>record.key===input.request_key)?.status,expected.toLowerCase());
+  await assert.rejects(f.product.submit(input),matches(expected));
+  await assert.rejects(f.product.submit({...input,requirements:`${input.requirements}\nChanged request body.`}),matches('CONFLICT'));
+  assert.equal(f.product.status().tasks.length,0);
+  assert.equal(f.fake.count('turn/start'),0);
+}
+
 function readAll(product: AutoDev, session: string, manifest: EvidenceManifest, pageSize = 128) {
   const contents: Record<string, string> = {};
   for (const artifact of manifest.artifacts) {
@@ -602,8 +612,31 @@ test('continued rounds retain the original binary review baseline',async t=>{
 test('binary modified before dispatch cannot hide behind the current task baseline',async t=>{
   const f=fixture(t);const input=scopedBinaryTask(f,'preexisting-binary-change');
   writeFileSync(path.join(f.workspace,'icon.png'),Buffer.from([0,9]));
-  await assert.rejects(f.product.submit(input),/changed from base_commit|outcome/i);
-  assert.equal(f.fake.count('turn/start'),0);
+  await assertScopeSubmitJournalState(f,input,'FAILED');
+});
+
+test('non-ancestor review base is a pre-dispatch scope rejection',async t=>{
+  const f=fixture(t);const input=scopedBinaryTask(f,'non-ancestor-review-base');
+  const tree=execFileSync('git',['write-tree'],{cwd:f.workspace,windowsHide:true,encoding:'utf8'}).trim();
+  const orphan=execFileSync('git',['-c','user.name=Fixture','-c','user.email=fixture@example.invalid','commit-tree',tree,'-m','Unrelated synthetic base'],{cwd:f.workspace,windowsHide:true,encoding:'utf8'}).trim();
+  const current=execFileSync('git',['rev-parse','HEAD'],{cwd:f.workspace,windowsHide:true,encoding:'utf8'}).trim();
+  input.requirements=input.requirements.replace(current,orphan);
+  await assertScopeSubmitJournalState(f,input,'FAILED');
+});
+
+test('uncertain submit dispatch errors remain uncertain after scope preflight handling',async t=>{
+  const f=fixture(t);const input=task('uncertain-submit-dispatch');
+  const request=f.fake.request.bind(f.fake);let threadStarts=0;
+  f.fake.request=async <T>(method:string,params?:unknown):Promise<T>=>{
+    if(method==='thread/start'){threadStarts++;throw Object.assign(new Error('Synthetic app-server timeout'),{code:'ETIMEDOUT'});}
+    return request<T>(method,params);
+  };
+  await assert.rejects(f.product.submit(input),(error:unknown)=>error instanceof JournalError&&error.code==='UNCERTAIN');
+  assert.equal(f.product.journal.list().find(record=>record.key===input.request_key)?.status,'uncertain');
+  await assert.rejects(f.product.submit(input),(error:unknown)=>error instanceof JournalError&&error.code==='UNCERTAIN');
+  await assert.rejects(f.product.submit({...input,requirements:'Different task.'}),(error:unknown)=>error instanceof JournalError&&error.code==='CONFLICT');
+  assert.equal(threadStarts,1);
+  assert.equal(f.product.status().tasks.length,1);
 });
 
 test('staged binary blob cannot be hidden by restoring its worktree bytes before scope capture',async t=>{
@@ -611,8 +644,7 @@ test('staged binary blob cannot be hidden by restoring its worktree bytes before
   writeFileSync(path.join(f.workspace,'icon.png'),Buffer.from([0,9]));
   execFileSync('git',['add','icon.png'],{cwd:f.workspace,windowsHide:true});
   writeFileSync(path.join(f.workspace,'icon.png'),Buffer.from([0,1,2,3]));
-  await assert.rejects(f.product.submit(input),/changed from base_commit|staged blob|outcome/i);
-  assert.equal(f.fake.count('turn/start'),0);
+  await assertScopeSubmitJournalState(f,input,'FAILED');
 });
 
 test('unmerged binary index without stage zero cannot be excluded',async t=>{
@@ -626,8 +658,7 @@ test('unmerged binary index without stage zero cannot be excluded',async t=>{
   execFileSync('git',['add','icon.png'],{cwd:f.workspace,windowsHide:true});
   execFileSync('git',['-c','user.name=Fixture','-c','user.email=fixture@example.invalid','-c','core.hooksPath=.no-test-hooks','commit','-m','Binary main change'],{cwd:f.workspace,windowsHide:true,stdio:'pipe'});
   assert.throws(()=>execFileSync('git',['merge','binary-side'],{cwd:f.workspace,windowsHide:true,stdio:'pipe'}));
-  await assert.rejects(f.product.submit(input),/stage-0|mode evidence|outcome/i);
-  assert.equal(f.fake.count('turn/start'),0);
+  await assertScopeSubmitJournalState(f,input,'FAILED');
 });
 
 test('legacy omitted binary state without hashes cannot acquire a pass after restart',async t=>{
