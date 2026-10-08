@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmdirSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmdirSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import path from "node:path";
 import test from "node:test";
@@ -475,12 +475,58 @@ test('change-scoped review excludes only pinned unchanged binaries, survives res
   const contents=readAll(restarted,'reviewer',manifest);
   assert.equal(JSON.stringify(contents).includes(fakeToken),false);
   const scope=JSON.parse(contents['review-scope.json']!);
-  assert.equal(scope.declaration.mode,'changes');assert.equal(scope.excluded[0].path,'icon.png');assert.match(scope.excluded[0].sha256,/^[a-f0-9]{64}$/);
+  assert.equal(scope.declaration.mode,'changes');assert.equal(scope.excluded[0].path,'icon.png');assert.match(scope.excluded[0].sha256,/^[a-f0-9]{64}$/);assert.equal(scope.excluded[0].git_mode,'100644');assert.equal(scope.excluded[0].working_mode,'100644');
   assert.equal((await restarted.review('reviewer',reviewInput(result.job_id!,manifest,'scoped-pass'))).review_status,'pass');
   assert.equal(new AutoDev(f.config,f.manager).status(result.job_id!).review_status,'pass');
   writeFileSync(path.join(f.workspace,'icon.png'),Buffer.from([0,1,2,4]));
   assert.equal(restarted.status(result.job_id!).review_status,'stale_review');
   assert.equal(new AutoDev(f.config,f.manager).status(result.job_id!).review_status,'stale_review');
+});
+
+test('chmod-only change to an excluded binary prevents review pass',async t=>{
+  if(process.platform==='win32'){t.skip('Windows does not expose Git executable-mode changes through chmod consistently.');return;}
+  const f=fixture(t);const result=await f.product.submit(scopedBinaryTask(f,'scoped-mode-change'));
+  chmodSync(path.join(f.workspace,'icon.png'),0o755);
+  f.fake.complete(result.thread_id!,result.turn_id!,f.workspace);
+  const manifest=f.product.seal(result.job_id!);readAll(f.product,'mode-reviewer',manifest);
+  await assert.rejects(f.product.review('mode-reviewer',reviewInput(result.job_id!,manifest,'reject-mode-change')),/changed|separate review/i);
+});
+
+test('Git mode-only change to an excluded binary prevents review pass',async t=>{
+  const f=fixture(t);const result=await f.product.submit(scopedBinaryTask(f,'scoped-git-mode-change'));
+  execFileSync('git',['update-index','--chmod=+x','--','icon.png'],{cwd:f.workspace,windowsHide:true});
+  f.fake.complete(result.thread_id!,result.turn_id!,f.workspace);
+  const manifest=f.product.seal(result.job_id!);readAll(f.product,'git-mode-reviewer',manifest);
+  await assert.rejects(f.product.review('git-mode-reviewer',reviewInput(result.job_id!,manifest,'reject-git-mode-change')),/changed|separate review/i);
+});
+
+test('first trusted change scope can bind on followup when excluded binaries match the initial snapshot',async t=>{
+  const f=fixture(t);const input=scopedBinaryTask(f,'late-scope-binding');
+  input.requirements=input.requirements.slice(input.requirements.indexOf('\n')+1);
+  const result=await f.product.submit(input);
+  f.fake.complete(result.thread_id!,result.turn_id!,f.workspace);
+  const base=execFileSync('git',['rev-parse','HEAD'],{cwd:f.workspace,windowsHide:true,encoding:'utf8'}).trim();
+  const requirements=`AutoDev-Review-Scope: ${JSON.stringify({mode:'changes',base_commit:base,excluded_binary_assets:[{path:'icon.png',reason:'Unchanged application icon unrelated to this calculation change.'}],required_binary_paths:[]})}\nContinue the requested source change.`;
+  const next=await f.product.continue({request_key:'bind-scope-followup',job_id:result.job_id!,requirements,acceptance:['The requested source change is complete.']});
+  const restarted=new AutoDev(f.config,f.manager);
+  f.fake.complete(next.thread_id!,next.turn_id!,f.workspace);
+  const manifest=restarted.seal(result.job_id!);const evidence=readAll(restarted,'scope-reviewer',manifest);
+  assert.equal(JSON.parse(evidence['review-scope.json']!).excluded[0].path,'icon.png');
+  await restarted.review('scope-reviewer',reviewInput(result.job_id!,manifest,'pass-first-scope'));
+});
+
+test('first followup scope cannot rebaseline a binary already changed by the initial turn',async t=>{
+  const f=fixture(t);const input=scopedBinaryTask(f,'late-scope-changed-binary');
+  input.requirements=input.requirements.slice(input.requirements.indexOf('\n')+1);
+  const result=await f.product.submit(input);
+  f.fake.complete(result.thread_id!,result.turn_id!,f.workspace);
+  writeFileSync(path.join(f.workspace,'icon.png'),Buffer.from([0,9]));
+  execFileSync('git',['add','icon.png'],{cwd:f.workspace,windowsHide:true});
+  execFileSync('git',['-c','user.name=Fixture','-c','user.email=fixture@example.invalid','-c','core.hooksPath=.no-test-hooks','commit','-m','Fixture prior binary mutation'],{cwd:f.workspace,windowsHide:true,stdio:'pipe'});
+  const changedBase=execFileSync('git',['rev-parse','HEAD'],{cwd:f.workspace,windowsHide:true,encoding:'utf8'}).trim();
+  const requirements=`AutoDev-Review-Scope: ${JSON.stringify({mode:'changes',base_commit:changedBase,excluded_binary_assets:[{path:'icon.png',reason:'Unchanged application icon unrelated to this calculation change.'}],required_binary_paths:[]})}\nContinue the requested source change.`;
+  await assert.rejects(f.product.continue({request_key:'reject-late-binary-rebase',job_id:result.job_id!,requirements,acceptance:['The requested source change is complete.']}));
+  assert.equal(f.fake.count('turn/start'),1);
 });
 
 test('changed, new and deleted binary assets remain blocking in a declared change scope',async t=>{

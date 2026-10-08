@@ -1,13 +1,13 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import test from 'node:test';
-import { assertReviewableOmissions, parseReviewScope, type ScopeEvidence } from '../src/review-scope.js';
+import { assertReviewableOmissions, assertScopeMatchesInitialSnapshot, parseReviewScope, type ScopeEvidence } from '../src/review-scope.js';
 import type { SourceSnapshot } from '../src/snapshot.js';
 
 const sha256=createHash('sha256').update(Buffer.from([0,1,2])).digest('hex');
-const binary={path:'public/icon.png',reason:'binary_requires_separate_review',sha256,bytes:3};
+const binary={path:'public/icon.png',reason:'binary_requires_separate_review',sha256,bytes:3,mode:'100644' as const,git_mode:'100644' as const};
 const source:SourceSnapshot={head:'a'.repeat(40),files:{},omitted:[binary]};
-const scope:ScopeEvidence={declaration:{mode:'changes',base_commit:'a'.repeat(40),excluded_binary_assets:[{path:binary.path,reason:'Existing unchanged application icon, unrelated to the affected accounting behavior.'}],required_binary_paths:[]},excluded:[{path:binary.path,reason:'Existing unchanged application icon, unrelated to the affected accounting behavior.',sha256,bytes:3}]};
+const scope:ScopeEvidence={declaration:{mode:'changes',base_commit:'a'.repeat(40),excluded_binary_assets:[{path:binary.path,reason:'Existing unchanged application icon, unrelated to the affected accounting behavior.'}],required_binary_paths:[]},excluded:[{path:binary.path,reason:'Existing unchanged application icon, unrelated to the affected accounting behavior.',sha256,bytes:3,git_mode:'100644',working_mode:'100644'}]};
 
 test('explicit leading change scope accepts exact paths and preserves its immutable baseline',()=>{
   const header=`AutoDev-Review-Scope: ${JSON.stringify(scope.declaration)}\nTask.`;
@@ -28,6 +28,13 @@ test('only explicitly scoped unchanged hashed binary evidence is eligible',()=>{
   for(const missing of [undefined,{declaration:{mode:'full' as const},excluded:[]}])assert.throws(()=>assertReviewableOmissions(source,source,missing),/separate review/);
   for(const omitted of [[],[{...binary,sha256:'b'.repeat(64)}],[{path:binary.path,reason:binary.reason}],[{...binary,reason:'non_utf8_requires_separate_review'}]])
     assert.throws(()=>assertReviewableOmissions(source,{...source,omitted},scope),/changed|evidence/);
+});
+
+test('a first followup scope binds only binary hash, size and mode matching the initial snapshot',()=>{
+  assert.doesNotThrow(()=>assertScopeMatchesInitialSnapshot(scope,source));
+  assert.throws(()=>assertScopeMatchesInitialSnapshot(scope,{...source,omitted:[{...binary,sha256:'b'.repeat(64)}]}),/changed since the initial baseline/);
+  assert.throws(()=>assertScopeMatchesInitialSnapshot(scope,{...source,omitted:[{...binary,mode:'100755'}]}),/changed since the initial baseline/);
+  assert.throws(()=>assertScopeMatchesInitialSnapshot(scope,{...source,omitted:[{path:binary.path,reason:binary.reason,sha256,bytes:3}]}),/changed since the initial baseline/);
 });
 
 test('redaction, UTF8 and required dependencies cannot be turned into binary exceptions',()=>{

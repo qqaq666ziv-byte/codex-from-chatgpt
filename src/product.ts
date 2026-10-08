@@ -11,10 +11,10 @@ import { snapshotSource, sourceDiff, type SourceSnapshot } from './snapshot.js';
 import { redactValue } from './redaction.js';
 import { ModelRouter, routingDecisionSchema, routingRequestSchema, classifyRoutingError, type RoutingRequest, type RoutingDecision } from './model-routing.js';
 import { ProjectRegistry, type CreateProjectInput } from './project-registry.js';
-import { parseReviewScope, captureReviewScope, assertReviewableOmissions, scopeEvidenceSchema } from './review-scope.js';
+import { parseReviewScope, captureReviewScope, assertScopeMatchesInitialSnapshot, assertReviewableOmissions, scopeEvidenceSchema } from './review-scope.js';
 
 const hash=(text:string)=>createHash('sha256').update(text).digest('hex');
-const sourceSchema=z.object({head:z.string().nullable(),files:z.record(z.string(),z.object({sha256:z.string(),content:z.string()})),omitted:z.array(z.object({path:z.string(),reason:z.string(),sha256:z.string().optional(),bytes:z.number().int().nonnegative().optional()}))});
+const sourceSchema=z.object({head:z.string().nullable(),files:z.record(z.string(),z.object({sha256:z.string(),content:z.string()})),omitted:z.array(z.object({path:z.string(),reason:z.string(),sha256:z.string().optional(),bytes:z.number().int().nonnegative().optional(),mode:z.enum(['100644','100755']).optional(),git_mode:z.enum(['100644','100755']).optional()}))});
 const reviewSchema=z.object({status:z.enum(['pending_chatgpt_review','pass','changes_requested']),summary:z.string().optional(),manifestId:z.string().optional(),reviewerSession:z.string().optional(),recordedAt:z.string().optional()});
 const roundSchema=z.object({requirements:z.string(),acceptance:z.array(z.string()),before:sourceSchema,reviewScope:scopeEvidenceSchema.optional(),turnId:z.string().nullable(),manifestId:z.string().nullable(),afterHash:z.string().nullable(),executionHash:z.string().nullable().default(null),review:reviewSchema,routingDecision:routingDecisionSchema.optional()});
 const attemptSchema=z.object({request_key:z.string(),operation:z.enum(['submit','continue']),round:z.number().int(),recorded_at:z.string(),decision:routingDecisionSchema});
@@ -120,9 +120,15 @@ export class AutoDev {
   private newRound(requirements:string,acceptance:string[],workspace:string,baseline?:Round):Round {
     const before=this.snapshot(workspace);
     const declaredScope=parseReviewScope(requirements);
-    if(baseline&&declaredScope&&JSON.stringify(declaredScope)!==JSON.stringify(baseline.reviewScope?.declaration))
-      throw new Error('A continued review cannot change the original pinned review scope.');
-    const reviewScope=baseline?baseline.reviewScope:captureReviewScope(workspace,declaredScope,before);
+    let reviewScope:Round['reviewScope'];
+    if(baseline?.reviewScope){
+      if(declaredScope&&JSON.stringify(declaredScope)!==JSON.stringify(baseline.reviewScope.declaration))
+        throw new Error('A continued review cannot change the original pinned review scope.');
+      reviewScope=baseline.reviewScope;
+    }else if(baseline&&declaredScope){
+      reviewScope=captureReviewScope(workspace,declaredScope,before);
+      if(reviewScope)assertScopeMatchesInitialSnapshot(reviewScope,baseline.before);
+    }else reviewScope=captureReviewScope(workspace,declaredScope,before);
     return {requirements,acceptance,before,...(reviewScope?{reviewScope}:{}),turnId:null,manifestId:null,afterHash:null,executionHash:null,review:{status:'pending_chatgpt_review'}};
   }
   private prompt(round:Round):string {
@@ -163,6 +169,7 @@ export class AutoDev {
       const requirements=repairing?`${input.requirements}\n\nOriginal task (preserve its scope):\n${record.rounds[0]!.requirements}\n\nIndependent reviewer findings (validate each finding before repairing; explain any rejected finding with evidence):\n${previous.review.summary??''}`:input.requirements;
       const round=this.newRound(requirements,repairing?[...new Set([...record.rounds[0]!.acceptance,...input.acceptance])]:input.acceptance,this.project(record.projectId).path,record.rounds[0]);
       this.seal(input.job_id);
+      if(!record.rounds[0]!.reviewScope&&round.reviewScope)record.rounds[0]!.reviewScope=round.reviewScope;
       if(decision)round.routingDecision=decision;
       record.rounds.push(round);this.save();
       let result;
