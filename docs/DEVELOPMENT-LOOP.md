@@ -40,8 +40,9 @@
 - source.json：目前全部可安全擷取的來源內容與遺漏資訊，包含未修改的相依程式。
 - execution.json：實際執行命令、結果、退出碼與 routing 證據。
 - source-identity.json：前後版本的檔案 hash 與來源限制。
+- review-scope.json：固定的本次審查範圍、未修改且無關的 binary 排除理由與 hash 證明；參見 [受影響功能審查](REVIEW-SCOPE.md)。
 
-一般 ChatGPT 獨立判斷後呼叫 `autodev_review`。讀取收據綁定認證連接、manifest 與全部分頁；版本改變或證據不完整不能 pass。程式只證明認證連接與證據身分，無法密碼學驗證遠端 reviewer 是哪個模型；真實 ChatGPT 驗收需另有一般對話的可見工具呼叫證據。
+一般 ChatGPT 獨立判斷後呼叫 `autodev_review`。預設評估本次變更、受影響功能與必要相依項目；完整來源不會自行擴大成全專案 E2E。讀取收據綁定認證連接、manifest 與全部分頁；版本改變或範圍內證據不完整不能 pass。程式只證明認證連接與證據身分，無法密碼學驗證遠端 reviewer 是哪個模型；真實 ChatGPT 驗收需另有一般對話的可見工具呼叫證據。
 
 `changes_requested` 後，ChatGPT 自行呼叫 `autodev_continue`，選擇適合修正工作的模型與 effort。伺服器保留原始要求與驗收，將 findings 交給 Codex 核實、修正並驗證。接著審查新的 manifest；舊 manifest 保持不可變。三輪修正仍未通過時停止自動修正，保留成果與未解問題。
 
@@ -51,7 +52,7 @@
 
 - 這是一般 ChatGPT **對話進行中**的循環。MCP server 不能保證喚醒已結束的對話；遇到平台工具上限、關閉對話或額度限制時，成果保留為 pending。回到同一對話說「繼續這個 AutoDev 任務」後，先用 status 恢復，不能重新 submit 同一工作。
 - ChatGPT 的寫入確認與 Codex 額外權限確認由平台決定；本機不繞過。需要新權限、憑證、付費或正式環境操作時停止。
-- 來源擷取目前有每檔 2 MiB、每專案 32 MiB 的界限；二進位或無法安全讀取的來源需要另外的審查證據，不能假裝完整通過。
+- 來源擷取目前有每檔 2 MiB、每專案 32 MiB 的界限；範圍內二進位或無法安全讀取的來源需要另外的審查證據。已固定基準、核對 hash 且明確與變更無關的未修改 binary 可排除，不會因既有圖示阻擋受影響功能的通過。
 - 執行 completed、審查 pending、routing blocked、recovery_required、stale_review 分開呈現。只有目前來源的持久 review pass 才可報工作流通過。
 - 現有服務必須在安全重啟後才會載入新程式；build 成功不代表執行中的舊程序已升級。
 

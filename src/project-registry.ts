@@ -107,7 +107,7 @@ export class ProjectRegistry {
     const registered=this.config.projects.find(p=>key(p.path)===key(target));
     const result=(p:{id:string;name:string;path:string},status:'created'|'existing')=>({project_id:p.id,name:p.name,workspace:p.path,status,next_action:'autodev_submit',instruction:'Immediately submit the original authorized development requirements with this project_id and a separate stable submit request_key. No manual workspace setup is needed.'});
     if(registered){
-      assertPlainDirectory(target);this.validate(target);
+      assertPlainDirectory(registered.path);this.validate(registered.path);
       if(key(registered.name.normalize('NFKC').trim())!==key(normalized.name))throw new ProjectError('PROJECT_CONFLICT');
       if(request?.status==='pending')throw new ProjectError('PROJECT_CREATION_UNCERTAIN');
       if(!request){request={key:input.request_key,...normalized,projectId:registered.id,status:'existing'};this.save({...state,requests:[...state.requests,request]});}

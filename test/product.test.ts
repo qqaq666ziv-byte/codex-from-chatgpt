@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, realpathSync, renameSync, rmdirSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmdirSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import test from "node:test";
 import type { AppServerClient, AppServerMessage, JsonRpcId } from "../src/codex-app-server.js";
@@ -104,6 +105,16 @@ async function finished(f: ReturnType<typeof fixture>, key = "start") {
   writeFileSync(path.join(f.workspace, "source.ts"), "export const value = 2;\n");
   f.fake.complete(result.thread_id!, result.turn_id!, f.workspace);
   return { result, manifest: f.product.seal(result.job_id!) };
+}
+
+async function assertScopeSubmitJournalState(f:ReturnType<typeof fixture>,input:ReturnType<typeof scopedBinaryTask>,expected:'UNCERTAIN'|'FAILED'){
+  const matches=(code:'UNCERTAIN'|'FAILED'|'CONFLICT')=>(error:unknown)=>error instanceof JournalError&&error.code===code;
+  await assert.rejects(f.product.submit(input),matches(expected));
+  assert.equal(f.product.journal.list().find(record=>record.key===input.request_key)?.status,expected.toLowerCase());
+  await assert.rejects(f.product.submit(input),matches(expected));
+  await assert.rejects(f.product.submit({...input,requirements:`${input.requirements}\nChanged request body.`}),matches('CONFLICT'));
+  assert.equal(f.product.status().tasks.length,0);
+  assert.equal(f.fake.count('turn/start'),0);
 }
 
 function readAll(product: AutoDev, session: string, manifest: EvidenceManifest, pageSize = 128) {
@@ -452,4 +463,301 @@ test("stale cancellation cannot interrupt a newer turn", async (t) => {
   assert.equal(f.fake.count("turn/interrupt"), 0);
   assert.equal(f.product.status(result.job_id!).turn_id, current.turn_id);
   assert.equal(f.product.status(result.job_id!).execution_status, "running");
+});
+
+function scopedBinaryTask(f:ReturnType<typeof fixture>,request_key:string) {
+  writeFileSync(path.join(f.workspace,'icon.png'),Buffer.from([0,1,2,3]));
+  execFileSync('git',['add','.'],{cwd:f.workspace,windowsHide:true});
+  execFileSync('git',['-c','user.name=Fixture','-c','user.email=fixture@example.invalid','-c','core.hooksPath=.no-test-hooks','commit','-m','Fixture baseline'],{cwd:f.workspace,windowsHide:true,stdio:'pipe'});
+  const base=execFileSync('git',['rev-parse','HEAD'],{cwd:f.workspace,windowsHide:true,encoding:'utf8'}).trim();
+  return {...task(request_key),requirements:`AutoDev-Review-Scope: ${JSON.stringify({mode:'changes',base_commit:base,excluded_binary_assets:[{path:'icon.png',reason:'Unchanged application icon unrelated to this calculation change.'}],required_binary_paths:[]})}\n${task(request_key).requirements}`};
+}
+
+function scopedBinaryModeTask(f:ReturnType<typeof fixture>,request_key:string,mode:number) {
+  const binary=path.join(f.workspace,'icon.png');writeFileSync(binary,Buffer.from([0,1,2,3]));chmodSync(binary,mode);
+  execFileSync('git',['add','.'],{cwd:f.workspace,windowsHide:true});
+  execFileSync('git',['-c','user.name=Fixture','-c','user.email=fixture@example.invalid','-c','core.hooksPath=.no-test-hooks','commit','-m','Fixture mode baseline'],{cwd:f.workspace,windowsHide:true,stdio:'pipe'});
+  const base=execFileSync('git',['rev-parse','HEAD'],{cwd:f.workspace,windowsHide:true,encoding:'utf8'}).trim();
+  return {...task(request_key),requirements:`AutoDev-Review-Scope: ${JSON.stringify({mode:'changes',base_commit:base,excluded_binary_assets:[{path:'icon.png',reason:'Unchanged application icon unrelated to this calculation change.'}],required_binary_paths:[]})}\n${task(request_key).requirements}`};
+}
+
+test('change-scoped review excludes only pinned unchanged binaries, survives restart and becomes stale after asset mutation',async t=>{
+  const f=fixture(t);const input=scopedBinaryTask(f,'scoped-unchanged');
+  const fakeToken=`sk-${'C'.repeat(26)}`;
+  input.requirements=input.requirements.replace('Unchanged application icon',`${fakeToken} Unchanged application icon`);
+  const result=await f.product.submit(input);
+  writeFileSync(path.join(f.workspace,'source.ts'),'export const value = 2;\n');
+  f.fake.complete(result.thread_id!,result.turn_id!,f.workspace);
+  const manifest=f.product.seal(result.job_id!);
+  const restarted=new AutoDev(f.config,f.manager);
+  const contents=readAll(restarted,'reviewer',manifest);
+  assert.equal(JSON.stringify(contents).includes(fakeToken),false);
+  const scope=JSON.parse(contents['review-scope.json']!);
+  assert.equal(scope.declaration.mode,'changes');assert.equal(scope.excluded[0].path,'icon.png');assert.match(scope.excluded[0].sha256,/^[a-f0-9]{64}$/);assert.equal(scope.excluded[0].git_mode,'100644');assert.equal(scope.excluded[0].working_mode,'100644');assert.match(scope.excluded[0].git_blob_oid,/^[a-f0-9]{40,64}$/);
+  assert.equal((await restarted.review('reviewer',reviewInput(result.job_id!,manifest,'scoped-pass'))).review_status,'pass');
+  assert.equal(new AutoDev(f.config,f.manager).status(result.job_id!).review_status,'pass');
+  writeFileSync(path.join(f.workspace,'icon.png'),Buffer.from([0,1,2,4]));
+  assert.equal(restarted.status(result.job_id!).review_status,'stale_review');
+  assert.equal(new AutoDev(f.config,f.manager).status(result.job_id!).review_status,'stale_review');
+});
+
+test('chmod-only change to an excluded binary prevents review pass',async t=>{
+  if(process.platform==='win32'){t.skip('Windows does not expose Git executable-mode changes through chmod consistently.');return;}
+  const f=fixture(t);const result=await f.product.submit(scopedBinaryTask(f,'scoped-mode-change'));
+  chmodSync(path.join(f.workspace,'icon.png'),0o755);
+  f.fake.complete(result.thread_id!,result.turn_id!,f.workspace);
+  const manifest=f.product.seal(result.job_id!);readAll(f.product,'mode-reviewer',manifest);
+  await assert.rejects(f.product.review('mode-reviewer',reviewInput(result.job_id!,manifest,'reject-mode-change')),/changed|separate review/i);
+});
+
+test('Git executable mode follows owner-execute at both permission boundaries',async t=>{
+  if(process.platform==='win32'){t.skip('Windows does not expose Git executable-mode changes through chmod consistently.');return;}
+  for(const [initialMode,changedMode,label] of [[0o755,0o655,'owner execute removed despite other execute bits'],[0o655,0o755,'owner execute added despite other execute bits']] as const){
+    const f=fixture(t);const result=await f.product.submit(scopedBinaryModeTask(f,`mode-boundary-${label}`,initialMode));
+    chmodSync(path.join(f.workspace,'icon.png'),changedMode);
+    f.fake.complete(result.thread_id!,result.turn_id!,f.workspace);
+    const manifest=f.product.seal(result.job_id!);readAll(f.product,`mode-reviewer-${label}`,manifest);
+    await assert.rejects(f.product.review(`mode-reviewer-${label}`,reviewInput(result.job_id!,manifest,`reject-mode-boundary-${label}`)),/changed|separate review/i);
+  }
+});
+
+test('Git mode-only change to an excluded binary prevents review pass',async t=>{
+  const f=fixture(t);const result=await f.product.submit(scopedBinaryTask(f,'scoped-git-mode-change'));
+  execFileSync('git',['update-index','--chmod=+x','--','icon.png'],{cwd:f.workspace,windowsHide:true});
+  f.fake.complete(result.thread_id!,result.turn_id!,f.workspace);
+  const manifest=f.product.seal(result.job_id!);readAll(f.product,'git-mode-reviewer',manifest);
+  await assert.rejects(f.product.review('git-mode-reviewer',reviewInput(result.job_id!,manifest,'reject-git-mode-change')),/changed|separate review/i);
+});
+
+test('staged binary blob changed after scope capture blocks pass when worktree bytes are restored',async t=>{
+  const f=fixture(t);const result=await f.product.submit(scopedBinaryTask(f,'staged-after-capture'));
+  writeFileSync(path.join(f.workspace,'icon.png'),Buffer.from([0,9]));
+  execFileSync('git',['add','icon.png'],{cwd:f.workspace,windowsHide:true});
+  writeFileSync(path.join(f.workspace,'icon.png'),Buffer.from([0,1,2,3]));
+  f.fake.complete(result.thread_id!,result.turn_id!,f.workspace);
+  const manifest=f.product.seal(result.job_id!);readAll(f.product,'staged-reviewer',manifest);
+  await assert.rejects(f.product.review('staged-reviewer',reviewInput(result.job_id!,manifest,'reject-staged-after-capture')),/changed|separate review/i);
+});
+
+test('committed binary mutation cannot be hidden by restoring index and worktree before scope capture',async t=>{
+  const f=fixture(t);const input=scopedBinaryTask(f,'head-binary-before-dispatch');
+  writeFileSync(path.join(f.workspace,'icon.png'),Buffer.from([0,9]));
+  execFileSync('git',['add','icon.png'],{cwd:f.workspace,windowsHide:true});
+  execFileSync('git',['-c','user.name=Fixture','-c','user.email=fixture@example.invalid','-c','core.hooksPath=.no-test-hooks','commit','-m','Committed binary change'],{cwd:f.workspace,windowsHide:true,stdio:'pipe'});
+  writeFileSync(path.join(f.workspace,'icon.png'),Buffer.from([0,1,2,3]));
+  execFileSync('git',['add','icon.png'],{cwd:f.workspace,windowsHide:true});
+  await assertScopeSubmitJournalState(f,input,'FAILED');
+});
+
+test('committed deletion cannot be hidden by restoring index and worktree before scope capture',async t=>{
+  const f=fixture(t);const input=scopedBinaryTask(f,'head-binary-delete-before-dispatch');
+  execFileSync('git',['rm','icon.png'],{cwd:f.workspace,windowsHide:true,stdio:'pipe'});
+  execFileSync('git',['-c','user.name=Fixture','-c','user.email=fixture@example.invalid','-c','core.hooksPath=.no-test-hooks','commit','-m','Committed binary deletion'],{cwd:f.workspace,windowsHide:true,stdio:'pipe'});
+  writeFileSync(path.join(f.workspace,'icon.png'),Buffer.from([0,1,2,3]));execFileSync('git',['add','icon.png'],{cwd:f.workspace,windowsHide:true});
+  await assertScopeSubmitJournalState(f,input,'FAILED');
+});
+
+test('committed binary mutation cannot be hidden by restoring index and worktree before final review',async t=>{
+  const f=fixture(t);const result=await f.product.submit(scopedBinaryTask(f,'head-binary-before-review'));
+  writeFileSync(path.join(f.workspace,'icon.png'),Buffer.from([0,9]));
+  execFileSync('git',['add','icon.png'],{cwd:f.workspace,windowsHide:true});
+  execFileSync('git',['-c','user.name=Fixture','-c','user.email=fixture@example.invalid','-c','core.hooksPath=.no-test-hooks','commit','-m','Committed binary change'],{cwd:f.workspace,windowsHide:true,stdio:'pipe'});
+  writeFileSync(path.join(f.workspace,'icon.png'),Buffer.from([0,1,2,3]));
+  execFileSync('git',['add','icon.png'],{cwd:f.workspace,windowsHide:true});
+  f.fake.complete(result.thread_id!,result.turn_id!,f.workspace);
+  const manifest=f.product.seal(result.job_id!);readAll(f.product,'head-binary-reviewer',manifest);
+  await assert.rejects(f.product.review('head-binary-reviewer',reviewInput(result.job_id!,manifest,'reject-head-binary-mutation')),/HEAD|changed|separate review/i);
+  assert.equal(f.product.status(result.job_id!).review_status,'pending_chatgpt_review');
+});
+
+test('committed executable-mode mutation cannot be hidden by restoring index and worktree before capture',async t=>{
+  if(process.platform==='win32'){t.skip('Windows does not expose Git executable-mode changes through chmod consistently.');return;}
+  const f=fixture(t);const input=scopedBinaryTask(f,'head-binary-mode-before-dispatch');const icon=path.join(f.workspace,'icon.png');
+  chmodSync(icon,0o755);execFileSync('git',['add','icon.png'],{cwd:f.workspace,windowsHide:true});
+  execFileSync('git',['-c','user.name=Fixture','-c','user.email=fixture@example.invalid','-c','core.hooksPath=.no-test-hooks','commit','-m','Committed executable mode'],{cwd:f.workspace,windowsHide:true,stdio:'pipe'});
+  chmodSync(icon,0o644);execFileSync('git',['add','icon.png'],{cwd:f.workspace,windowsHide:true});
+  await assertScopeSubmitJournalState(f,input,'FAILED');
+});
+
+test('committed executable-mode mutation cannot be hidden by restoring index and worktree before final review',async t=>{
+  if(process.platform==='win32'){t.skip('Windows does not expose Git executable-mode changes through chmod consistently.');return;}
+  const f=fixture(t);const result=await f.product.submit(scopedBinaryTask(f,'head-binary-mode-before-review'));const icon=path.join(f.workspace,'icon.png');
+  chmodSync(icon,0o755);execFileSync('git',['add','icon.png'],{cwd:f.workspace,windowsHide:true});
+  execFileSync('git',['-c','user.name=Fixture','-c','user.email=fixture@example.invalid','-c','core.hooksPath=.no-test-hooks','commit','-m','Committed executable mode'],{cwd:f.workspace,windowsHide:true,stdio:'pipe'});
+  chmodSync(icon,0o644);execFileSync('git',['add','icon.png'],{cwd:f.workspace,windowsHide:true});
+  f.fake.complete(result.thread_id!,result.turn_id!,f.workspace);
+  const manifest=f.product.seal(result.job_id!);readAll(f.product,'head-mode-reviewer',manifest);
+  await assert.rejects(f.product.review('head-mode-reviewer',reviewInput(result.job_id!,manifest,'reject-head-binary-mode')),/HEAD|changed|separate review/i);
+});
+
+test('first trusted change scope can bind on followup when excluded binaries match the initial snapshot',async t=>{
+  const f=fixture(t);const input=scopedBinaryTask(f,'late-scope-binding');
+  input.requirements=input.requirements.slice(input.requirements.indexOf('\n')+1);
+  const result=await f.product.submit(input);
+  f.fake.complete(result.thread_id!,result.turn_id!,f.workspace);
+  const base=execFileSync('git',['rev-parse','HEAD'],{cwd:f.workspace,windowsHide:true,encoding:'utf8'}).trim();
+  const requirements=`AutoDev-Review-Scope: ${JSON.stringify({mode:'changes',base_commit:base,excluded_binary_assets:[{path:'icon.png',reason:'Unchanged application icon unrelated to this calculation change.'}],required_binary_paths:[]})}\nContinue the requested source change.`;
+  const next=await f.product.continue({request_key:'bind-scope-followup',job_id:result.job_id!,requirements,acceptance:['The requested source change is complete.']});
+  const restarted=new AutoDev(f.config,f.manager);
+  f.fake.complete(next.thread_id!,next.turn_id!,f.workspace);
+  const manifest=restarted.seal(result.job_id!);const evidence=readAll(restarted,'scope-reviewer',manifest);
+  assert.equal(JSON.parse(evidence['review-scope.json']!).excluded[0].path,'icon.png');
+  await restarted.review('scope-reviewer',reviewInput(result.job_id!,manifest,'pass-first-scope'));
+});
+
+test('first followup scope cannot rebaseline a binary already changed by the initial turn',async t=>{
+  const f=fixture(t);const input=scopedBinaryTask(f,'late-scope-changed-binary');
+  input.requirements=input.requirements.slice(input.requirements.indexOf('\n')+1);
+  const result=await f.product.submit(input);
+  f.fake.complete(result.thread_id!,result.turn_id!,f.workspace);
+  writeFileSync(path.join(f.workspace,'icon.png'),Buffer.from([0,9]));
+  execFileSync('git',['add','icon.png'],{cwd:f.workspace,windowsHide:true});
+  execFileSync('git',['-c','user.name=Fixture','-c','user.email=fixture@example.invalid','-c','core.hooksPath=.no-test-hooks','commit','-m','Fixture prior binary mutation'],{cwd:f.workspace,windowsHide:true,stdio:'pipe'});
+  const changedBase=execFileSync('git',['rev-parse','HEAD'],{cwd:f.workspace,windowsHide:true,encoding:'utf8'}).trim();
+  const requirements=`AutoDev-Review-Scope: ${JSON.stringify({mode:'changes',base_commit:changedBase,excluded_binary_assets:[{path:'icon.png',reason:'Unchanged application icon unrelated to this calculation change.'}],required_binary_paths:[]})}\nContinue the requested source change.`;
+  await assert.rejects(f.product.continue({request_key:'reject-late-binary-rebase',job_id:result.job_id!,requirements,acceptance:['The requested source change is complete.']}));
+  assert.equal(f.fake.count('turn/start'),1);
+});
+
+test('changed, new and deleted binary assets remain blocking in a declared change scope',async t=>{
+  for(const operation of ['change','new','delete','late-change'] as const){
+    const f=fixture(t);const result=await f.product.submit(scopedBinaryTask(f,`scoped-${operation}`));
+    if(operation==='change')writeFileSync(path.join(f.workspace,'icon.png'),Buffer.from([0,9]));
+    if(operation==='new')writeFileSync(path.join(f.workspace,'new.png'),Buffer.from([0,9]));
+    if(operation==='delete')unlinkSync(path.join(f.workspace,'icon.png'));
+    f.fake.complete(result.thread_id!,result.turn_id!,f.workspace);
+    const manifest=f.product.seal(result.job_id!);readAll(f.product,'reviewer',manifest);
+    if(operation==='late-change')writeFileSync(path.join(f.workspace,'icon.png'),Buffer.from([0,9]));
+    await assert.rejects(f.product.review('reviewer',reviewInput(result.job_id!,manifest,`reject-${operation}`)),/changed|separate review|disappeared/i);
+    assert.equal(f.product.status(result.job_id!).review_status,'pending_chatgpt_review');
+  }
+});
+
+test('continued rounds retain the original binary review baseline',async t=>{
+  const f=fixture(t);const result=await f.product.submit(scopedBinaryTask(f,'cumulative-binary-baseline'));
+  writeFileSync(path.join(f.workspace,'source.ts'),'export const value = 2;\n');
+  f.fake.complete(result.thread_id!,result.turn_id!,f.workspace);
+  const firstManifest=f.product.seal(result.job_id!);readAll(f.product,'binary-reviewer',firstManifest);
+  await f.product.review('binary-reviewer',{...reviewInput(result.job_id!,firstManifest,'binary-finding'),verdict:'changes_requested',summary:'The source change needs one more focused regression.'});
+
+  writeFileSync(path.join(f.workspace,'icon.png'),Buffer.from([0,9]));
+  execFileSync('git',['add','icon.png'],{cwd:f.workspace,windowsHide:true});
+  execFileSync('git',['-c','user.name=Fixture','-c','user.email=fixture@example.invalid','-c','core.hooksPath=.no-test-hooks','commit','-m','Fixture binary change'],{cwd:f.workspace,windowsHide:true,stdio:'pipe'});
+  const changedBase=execFileSync('git',['rev-parse','HEAD'],{cwd:f.workspace,windowsHide:true,encoding:'utf8'}).trim();
+  const replacementScope=`AutoDev-Review-Scope: ${JSON.stringify({mode:'changes',base_commit:changedBase,excluded_binary_assets:[{path:'icon.png',reason:'Unchanged application icon unrelated to this calculation change.'}],required_binary_paths:[]})}`;
+  await assert.rejects(f.product.continue({request_key:'rebase-binary-scope',job_id:result.job_id!,requirements:`${replacementScope}\nRepair the regression.`,acceptance:['The regression passes.']}));
+  assert.equal(f.fake.count('turn/start'),1);
+
+  const next=await f.product.continue({request_key:'cumulative-binary-repair',job_id:result.job_id!,requirements:'Add the requested focused regression.',acceptance:['The focused regression passes.']});
+  f.fake.complete(next.thread_id!,next.turn_id!,f.workspace);
+  const nextManifest=f.product.seal(result.job_id!);readAll(f.product,'binary-reviewer',nextManifest);
+  await f.product.review('binary-reviewer',{...reviewInput(result.job_id!,nextManifest,'second-binary-finding'),verdict:'changes_requested',summary:'One more source regression remains.'});
+
+  const restarted=new AutoDev(f.config,f.manager);
+  const finalTurn=await restarted.continue({request_key:'cumulative-binary-final',job_id:result.job_id!,requirements:'Finish the remaining regression.',acceptance:['All regressions pass.']});
+  f.fake.complete(finalTurn.thread_id!,finalTurn.turn_id!,f.workspace);
+  const finalManifest=restarted.seal(result.job_id!);readAll(restarted,'binary-reviewer',finalManifest);
+  await assert.rejects(restarted.review('binary-reviewer',{...reviewInput(result.job_id!,finalManifest,'cumulative-binary-pass'),summary:'The regressions pass and source review is complete.'}),/changed|separate review/i);
+});
+
+test('binary modified before dispatch cannot hide behind the current task baseline',async t=>{
+  const f=fixture(t);const input=scopedBinaryTask(f,'preexisting-binary-change');
+  writeFileSync(path.join(f.workspace,'icon.png'),Buffer.from([0,9]));
+  await assertScopeSubmitJournalState(f,input,'FAILED');
+});
+
+test('non-ancestor review base is a pre-dispatch scope rejection',async t=>{
+  const f=fixture(t);const input=scopedBinaryTask(f,'non-ancestor-review-base');
+  const tree=execFileSync('git',['write-tree'],{cwd:f.workspace,windowsHide:true,encoding:'utf8'}).trim();
+  const orphan=execFileSync('git',['-c','user.name=Fixture','-c','user.email=fixture@example.invalid','commit-tree',tree,'-m','Unrelated synthetic base'],{cwd:f.workspace,windowsHide:true,encoding:'utf8'}).trim();
+  const current=execFileSync('git',['rev-parse','HEAD'],{cwd:f.workspace,windowsHide:true,encoding:'utf8'}).trim();
+  input.requirements=input.requirements.replace(current,orphan);
+  await assertScopeSubmitJournalState(f,input,'FAILED');
+});
+
+test('missing full review base SHA is a definitive pre-dispatch rejection',async t=>{
+  const f=fixture(t);const input=scopedBinaryTask(f,'missing-review-base');
+  const current=execFileSync('git',['rev-parse','HEAD'],{cwd:f.workspace,windowsHide:true,encoding:'utf8'}).trim();
+  input.requirements=input.requirements.replace(current,'f'.repeat(40));
+  await assertScopeSubmitJournalState(f,input,'FAILED');
+});
+
+test('Git repository read failure during scope preflight remains uncertain',async t=>{
+  const f=fixture(t);const input=scopedBinaryTask(f,'git-scope-io-failure');
+  renameSync(path.join(f.workspace,'.git'),path.join(f.workspace,'.git-unavailable'));
+  await assertScopeSubmitJournalState(f,input,'UNCERTAIN');
+});
+
+test('uncertain submit dispatch errors remain uncertain after scope preflight handling',async t=>{
+  const f=fixture(t);const input=task('uncertain-submit-dispatch');
+  const request=f.fake.request.bind(f.fake);let threadStarts=0;
+  f.fake.request=async <T>(method:string,params?:unknown):Promise<T>=>{
+    if(method==='thread/start'){threadStarts++;throw Object.assign(new Error('Synthetic app-server timeout'),{code:'ETIMEDOUT'});}
+    return request<T>(method,params);
+  };
+  await assert.rejects(f.product.submit(input),(error:unknown)=>error instanceof JournalError&&error.code==='UNCERTAIN');
+  assert.equal(f.product.journal.list().find(record=>record.key===input.request_key)?.status,'uncertain');
+  await assert.rejects(f.product.submit(input),(error:unknown)=>error instanceof JournalError&&error.code==='UNCERTAIN');
+  await assert.rejects(f.product.submit({...input,requirements:'Different task.'}),(error:unknown)=>error instanceof JournalError&&error.code==='CONFLICT');
+  assert.equal(threadStarts,1);
+  assert.equal(f.product.status().tasks.length,1);
+});
+
+test('staged binary blob cannot be hidden by restoring its worktree bytes before scope capture',async t=>{
+  const f=fixture(t);const input=scopedBinaryTask(f,'staged-restored-binary');
+  writeFileSync(path.join(f.workspace,'icon.png'),Buffer.from([0,9]));
+  execFileSync('git',['add','icon.png'],{cwd:f.workspace,windowsHide:true});
+  writeFileSync(path.join(f.workspace,'icon.png'),Buffer.from([0,1,2,3]));
+  await assertScopeSubmitJournalState(f,input,'FAILED');
+});
+
+test('unmerged binary index without stage zero cannot be excluded',async t=>{
+  const f=fixture(t);const input=scopedBinaryTask(f,'unmerged-binary-index');
+  execFileSync('git',['checkout','-b','binary-side'],{cwd:f.workspace,windowsHide:true,stdio:'pipe'});
+  writeFileSync(path.join(f.workspace,'icon.png'),Buffer.from([0,5,6]));
+  execFileSync('git',['add','icon.png'],{cwd:f.workspace,windowsHide:true});
+  execFileSync('git',['-c','user.name=Fixture','-c','user.email=fixture@example.invalid','-c','core.hooksPath=.no-test-hooks','commit','-m','Binary side change'],{cwd:f.workspace,windowsHide:true,stdio:'pipe'});
+  execFileSync('git',['checkout','-'],{cwd:f.workspace,windowsHide:true,stdio:'pipe'});
+  writeFileSync(path.join(f.workspace,'icon.png'),Buffer.from([0,7,8]));
+  execFileSync('git',['add','icon.png'],{cwd:f.workspace,windowsHide:true});
+  execFileSync('git',['-c','user.name=Fixture','-c','user.email=fixture@example.invalid','-c','core.hooksPath=.no-test-hooks','commit','-m','Binary main change'],{cwd:f.workspace,windowsHide:true,stdio:'pipe'});
+  assert.throws(()=>execFileSync('git',['merge','binary-side'],{cwd:f.workspace,windowsHide:true,stdio:'pipe'}));
+  await assertScopeSubmitJournalState(f,input,'FAILED');
+});
+
+test('binary path typechange to a symlink cannot be excluded',async t=>{
+  if(process.platform==='win32'){t.skip('Windows symlink creation is not consistently available in the fixture environment.');return;}
+  const f=fixture(t);const input=scopedBinaryTask(f,'binary-typechange');
+  unlinkSync(path.join(f.workspace,'icon.png'));symlinkSync('source.ts',path.join(f.workspace,'icon.png'));
+  execFileSync('git',['add','icon.png'],{cwd:f.workspace,windowsHide:true});
+  await assertScopeSubmitJournalState(f,input,'FAILED');
+});
+
+test('legacy omitted binary state without hashes cannot acquire a pass after restart',async t=>{
+  const f=fixture(t);const result=await f.product.submit(scopedBinaryTask(f,'legacy-binary'));
+  f.fake.complete(result.thread_id!,result.turn_id!,f.workspace);
+  const filename=path.join(f.runtimeDir,'product-state.json');
+  const envelope=JSON.parse(readFileSync(filename,'utf8'));
+  const round=envelope.state.records[0].rounds[0];
+  delete round.reviewScope;delete round.before.omitted[0].sha256;delete round.before.omitted[0].bytes;
+  envelope.checksum=createHash('sha256').update(JSON.stringify(envelope.state)).digest('hex');
+  writeFileSync(filename,JSON.stringify(envelope));
+  const restarted=new AutoDev(f.config,f.manager);const manifest=restarted.seal(result.job_id!);readAll(restarted,'reviewer',manifest);
+  await assert.rejects(restarted.review('reviewer',reviewInput(result.job_id!,manifest,'reject-legacy')),/separate review/);
+  const next=await restarted.continue({request_key:'legacy-binary-followup',job_id:result.job_id!,requirements:'Continue the task after restart.',acceptance:['The task is complete.']});
+  f.fake.complete(next.thread_id!,next.turn_id!,f.workspace);
+  const resumed=new AutoDev(f.config,f.manager);const resumedManifest=resumed.seal(result.job_id!);readAll(resumed,'reviewer',resumedManifest);
+  await assert.rejects(resumed.review('reviewer',reviewInput(result.job_id!,resumedManifest,'reject-legacy-followup')),/separate review/);
+});
+
+test('restart with missing HEAD-tree exclusion evidence cannot pass review',async t=>{
+  const f=fixture(t);const result=await f.product.submit(scopedBinaryTask(f,'missing-head-evidence-after-restart'));
+  f.fake.complete(result.thread_id!,result.turn_id!,f.workspace);
+  const manifest=f.product.seal(result.job_id!);readAll(f.product,'missing-head-reviewer',manifest);
+  const filename=path.join(f.runtimeDir,'product-state.json');const envelope=JSON.parse(readFileSync(filename,'utf8'));
+  const omitted=envelope.state.records[0].rounds[0].before.omitted.find((item:{path:string})=>item.path==='icon.png');
+  delete omitted.head_git_mode;delete omitted.head_git_oid;
+  envelope.checksum=createHash('sha256').update(JSON.stringify(envelope.state)).digest('hex');writeFileSync(filename,JSON.stringify(envelope));
+  const restarted=new AutoDev(f.config,f.manager);readAll(restarted,'missing-head-reviewer',manifest);
+  await assert.rejects(restarted.review('missing-head-reviewer',reviewInput(result.job_id!,manifest,'reject-missing-head-evidence')),/HEAD|changed|separate review/i);
 });
