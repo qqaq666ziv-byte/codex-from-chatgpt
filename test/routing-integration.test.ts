@@ -1,12 +1,13 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync,mkdtempSync,realpathSync,rmSync,writeFileSync } from 'node:fs';
+import { mkdirSync,mkdtempSync,readFileSync,realpathSync,rmSync,writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { AppServerError,type AppServerClient,type AppServerMessage,type JsonRpcId } from '../src/codex-app-server.js';
 import { JobManager } from '../src/jobs.js';
 import { StateStore } from '../src/store.js';
 import { AutoDev, RoutingSelectionRequiredError } from '../src/product.js';
+import { JournalError } from '../src/journal.js';
 import { ModelCatalog,ModelRouter,type RoutingDecision } from '../src/model-routing.js';
 import type { LocalConfig } from '../src/local-config.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -98,6 +99,19 @@ test('blocked decisions persist, replay without dispatch and leave prior sealed 
   const status=f.product.status(first.job_id!) as any;assert.equal(status.round,1);assert.equal(status.routing_status,'blocked');assert.equal(status.manifest_id,manifest.id);assert.deepEqual(f.jobs.evidence(first.job_id!),prior);
   const reloaded=new AutoDev(f.config,new JobManager(new Executor(),f.options),f.router);
   assert.equal(reloaded.status(blocked.job_id!).execution_status,'blocked');assert.equal((reloaded.status(first.job_id!) as any).routing_attempt.decision.status,'blocked');
+});
+test('routed continuation scope rejection leaves durable round and routing history unchanged',async t=>{
+  const f=fixture(t);const started=await f.product.submit({...task('scope-routed-first'),requirements:'AutoDev-Review-Scope: {"mode":"full"}\nIndependent fixture task.',routing:{model:'gpt-5.6-terra',effort:'high'}});assert.ok('thread_id' in started&&started.thread_id&&started.turn_id);
+  f.server.finish(started.thread_id,started.turn_id);const manifest=f.product.seal(started.job_id!);
+  for(const artifact of manifest.artifacts){let cursor:string|undefined;do{const page=f.product.readArtifact('scope-routed-reviewer',manifest.id,artifact.name,cursor);cursor=page.nextCursor??undefined;}while(cursor);}
+  await f.product.review('scope-routed-reviewer',{request_key:'scope-routed-review',job_id:started.job_id!,manifest_id:manifest.id,verdict:'changes_requested',summary:'Retain the pinned review baseline.'});
+  const before=readFileSync(path.join(f.config.runtimeDir,'product-state.json'),'utf8');
+  const requirements=`AutoDev-Review-Scope: ${JSON.stringify({mode:'changes',base_commit:'a'.repeat(40),excluded_binary_assets:[],required_binary_paths:[]})}\nRepair the reviewed issue.`;
+  await assert.rejects(f.product.continue({request_key:'scope-routed-rejected',job_id:started.job_id!,requirements,acceptance:['The issue is fixed.'],routing:{model:'gpt-5.6-terra',effort:'high'}}),error=>error instanceof JournalError&&error.code==='FAILED');
+  assert.equal(f.server.count('turn/start'),1);
+  assert.equal(readFileSync(path.join(f.config.runtimeDir,'product-state.json'),'utf8'),before);
+  const status=f.product.status(started.job_id!) as any;assert.equal(status.round,1);assert.equal(status.routing_attempt.request_key,'scope-routed-first');
+  assert.equal(f.product.journal.list().find(record=>record.key==='scope-routed-rejected')!.status,'failed');
 });
 test('enabling routing preserves exact legacy execution bytes and manifest across restart',async t=>{
   const f=fixture(t,false);const {routing:ignored,...legacy}=task('legacy');void ignored;const started=await f.product.submit(legacy);assert.ok('thread_id' in started&&started.thread_id&&started.turn_id);f.server.finish(started.thread_id,started.turn_id);

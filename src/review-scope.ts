@@ -42,7 +42,18 @@ export function captureReviewScope(workspace:string,declaration:ReviewScope|unde
   if(!declaration)return undefined; // Legacy evidence remains strict; missing hashes are never inferred.
   if(declaration.mode==='full')return {declaration,excluded:[]};
   const base=declaration.base_commit;
-  if(git(workspace,['rev-parse','--verify',`${base}^{commit}`]).toString('utf8').trim()!==base)
+  // cat-file reports a missing object as a successful, explicit response. This
+  // lets us distinguish an invalid pinned SHA from Git/I/O failures, which must
+  // remain uncertain at the journal boundary.
+  const object=spawnSync('git',['--no-optional-locks','cat-file','--batch-check'],{cwd:workspace,windowsHide:true,encoding:'utf8',input:`${base}\n`,stdio:['pipe','pipe','pipe']});
+  if(object.error)throw object.error;
+  if(object.status!==0)throw new Error('Could not verify review scope base_commit object.');
+  const objectLine=object.stdout.trim();
+  if(objectLine===`${base} missing`)
+    throw new ReviewScopeValidationError('Review scope base_commit must identify an existing full commit SHA in the current HEAD ancestry.');
+  const objectMatch=/^([a-f0-9]{40,64}) (commit|tree|blob|tag) \d+$/.exec(objectLine);
+  if(!objectMatch)throw new Error('Could not verify review scope base_commit object.');
+  if(objectMatch[1]!==base||objectMatch[2]!=='commit')
     throw new ReviewScopeValidationError('Review scope base_commit must identify an existing full commit SHA in the current HEAD ancestry.');
   const ancestry=spawnSync('git',['--no-optional-locks','merge-base','--is-ancestor',base,'HEAD'],{cwd:workspace,windowsHide:true,encoding:'utf8',stdio:['ignore','pipe','pipe']});
   if(ancestry.error)throw ancestry.error;

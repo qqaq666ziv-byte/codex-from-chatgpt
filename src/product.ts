@@ -164,8 +164,10 @@ export class AutoDev {
       const status=this.jobs.get(input.job_id);if(active.has(status.status))throw new Error('Previous execution is active or uncertain.');
       const decision=await this.router?.select(input.routing);
       if(input.routing&&!this.router)throw new Error('Routing requires the configured local model catalog.');
-      if(decision){(record.routingAttempts??=[]).push({request_key:input.request_key,operation:'continue',round:record.rounds.length+1,recorded_at:new Date().toISOString(),decision});this.save();}
-      if(decision?.status==='blocked')return {job_id:input.job_id,status:'blocked' as const,review_status:this.current(input.job_id).review.status,routing:decision};
+      if(decision?.status==='blocked'){
+        (record.routingAttempts??=[]).push({request_key:input.request_key,operation:'continue',round:record.rounds.length+1,recorded_at:new Date().toISOString(),decision});this.save();
+        return {job_id:input.job_id,status:'blocked' as const,review_status:this.current(input.job_id).review.status,routing:decision};
+      }
       const previous=this.current(input.job_id);
       const repairing=previous.review.status==='changes_requested';
       const requirements=repairing?`${input.requirements}\n\nOriginal task (preserve its scope):\n${record.rounds[0]!.requirements}\n\nIndependent reviewer findings (validate each finding before repairing; explain any rejected finding with evidence):\n${previous.review.summary??''}`:input.requirements;
@@ -175,7 +177,9 @@ export class AutoDev {
       this.seal(input.job_id);
       if(!record.rounds[0]!.reviewScope&&round.reviewScope)record.rounds[0]!.reviewScope=round.reviewScope;
       if(decision)round.routingDecision=decision;
-      record.rounds.push(round);this.save();
+      record.rounds.push(round);
+      if(decision)(record.routingAttempts??=[]).push({request_key:input.request_key,operation:'continue',round:record.rounds.length,recorded_at:new Date().toISOString(),decision});
+      this.save();
       let result;
       try {result=await this.jobs.continue(input.job_id,this.prompt(round),decision);}
       catch(error){

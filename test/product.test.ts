@@ -624,6 +624,19 @@ test('non-ancestor review base is a pre-dispatch scope rejection',async t=>{
   await assertScopeSubmitJournalState(f,input,'FAILED');
 });
 
+test('missing full review base SHA is a definitive pre-dispatch rejection',async t=>{
+  const f=fixture(t);const input=scopedBinaryTask(f,'missing-review-base');
+  const current=execFileSync('git',['rev-parse','HEAD'],{cwd:f.workspace,windowsHide:true,encoding:'utf8'}).trim();
+  input.requirements=input.requirements.replace(current,'f'.repeat(40));
+  await assertScopeSubmitJournalState(f,input,'FAILED');
+});
+
+test('Git repository read failure during scope preflight remains uncertain',async t=>{
+  const f=fixture(t);const input=scopedBinaryTask(f,'git-scope-io-failure');
+  renameSync(path.join(f.workspace,'.git'),path.join(f.workspace,'.git-unavailable'));
+  await assertScopeSubmitJournalState(f,input,'UNCERTAIN');
+});
+
 test('uncertain submit dispatch errors remain uncertain after scope preflight handling',async t=>{
   const f=fixture(t);const input=task('uncertain-submit-dispatch');
   const request=f.fake.request.bind(f.fake);let threadStarts=0;
