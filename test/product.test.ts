@@ -499,16 +499,29 @@ test('changed, new and deleted binary assets remain blocking in a declared chang
 
 test('continued rounds retain the original binary review baseline',async t=>{
   const f=fixture(t);const result=await f.product.submit(scopedBinaryTask(f,'cumulative-binary-baseline'));
-  writeFileSync(path.join(f.workspace,'icon.png'),Buffer.from([0,9]));
   writeFileSync(path.join(f.workspace,'source.ts'),'export const value = 2;\n');
   f.fake.complete(result.thread_id!,result.turn_id!,f.workspace);
   const firstManifest=f.product.seal(result.job_id!);readAll(f.product,'binary-reviewer',firstManifest);
   await f.product.review('binary-reviewer',{...reviewInput(result.job_id!,firstManifest,'binary-finding'),verdict:'changes_requested',summary:'The source change needs one more focused regression.'});
 
+  writeFileSync(path.join(f.workspace,'icon.png'),Buffer.from([0,9]));
+  execFileSync('git',['add','icon.png'],{cwd:f.workspace,windowsHide:true});
+  execFileSync('git',['-c','user.name=Fixture','-c','user.email=fixture@example.invalid','-c','core.hooksPath=.no-test-hooks','commit','-m','Fixture binary change'],{cwd:f.workspace,windowsHide:true,stdio:'pipe'});
+  const changedBase=execFileSync('git',['rev-parse','HEAD'],{cwd:f.workspace,windowsHide:true,encoding:'utf8'}).trim();
+  const replacementScope=`AutoDev-Review-Scope: ${JSON.stringify({mode:'changes',base_commit:changedBase,excluded_binary_assets:[{path:'icon.png',reason:'Unchanged application icon unrelated to this calculation change.'}],required_binary_paths:[]})}`;
+  await assert.rejects(f.product.continue({request_key:'rebase-binary-scope',job_id:result.job_id!,requirements:`${replacementScope}\nRepair the regression.`,acceptance:['The regression passes.']}));
+  assert.equal(f.fake.count('turn/start'),1);
+
   const next=await f.product.continue({request_key:'cumulative-binary-repair',job_id:result.job_id!,requirements:'Add the requested focused regression.',acceptance:['The focused regression passes.']});
   f.fake.complete(next.thread_id!,next.turn_id!,f.workspace);
   const nextManifest=f.product.seal(result.job_id!);readAll(f.product,'binary-reviewer',nextManifest);
-  await assert.rejects(f.product.review('binary-reviewer',{...reviewInput(result.job_id!,nextManifest,'cumulative-binary-pass'),summary:'The focused regression passes and source review is complete.'}),/changed|separate review/i);
+  await f.product.review('binary-reviewer',{...reviewInput(result.job_id!,nextManifest,'second-binary-finding'),verdict:'changes_requested',summary:'One more source regression remains.'});
+
+  const restarted=new AutoDev(f.config,f.manager);
+  const finalTurn=await restarted.continue({request_key:'cumulative-binary-final',job_id:result.job_id!,requirements:'Finish the remaining regression.',acceptance:['All regressions pass.']});
+  f.fake.complete(finalTurn.thread_id!,finalTurn.turn_id!,f.workspace);
+  const finalManifest=restarted.seal(result.job_id!);readAll(restarted,'binary-reviewer',finalManifest);
+  await assert.rejects(restarted.review('binary-reviewer',{...reviewInput(result.job_id!,finalManifest,'cumulative-binary-pass'),summary:'The regressions pass and source review is complete.'}),/changed|separate review/i);
 });
 
 test('binary modified before dispatch cannot hide behind the current task baseline',async t=>{
@@ -529,4 +542,8 @@ test('legacy omitted binary state without hashes cannot acquire a pass after res
   writeFileSync(filename,JSON.stringify(envelope));
   const restarted=new AutoDev(f.config,f.manager);const manifest=restarted.seal(result.job_id!);readAll(restarted,'reviewer',manifest);
   await assert.rejects(restarted.review('reviewer',reviewInput(result.job_id!,manifest,'reject-legacy')),/separate review/);
+  const next=await restarted.continue({request_key:'legacy-binary-followup',job_id:result.job_id!,requirements:'Continue the task after restart.',acceptance:['The task is complete.']});
+  f.fake.complete(next.thread_id!,next.turn_id!,f.workspace);
+  const resumed=new AutoDev(f.config,f.manager);const resumedManifest=resumed.seal(result.job_id!);readAll(resumed,'reviewer',resumedManifest);
+  await assert.rejects(resumed.review('reviewer',reviewInput(result.job_id!,resumedManifest,'reject-legacy-followup')),/separate review/);
 });

@@ -158,11 +158,11 @@ export class AutoDev {
       if(input.routing&&!this.router)throw new Error('Routing requires the configured local model catalog.');
       if(decision){(record.routingAttempts??=[]).push({request_key:input.request_key,operation:'continue',round:record.rounds.length+1,recorded_at:new Date().toISOString(),decision});this.save();}
       if(decision?.status==='blocked')return {job_id:input.job_id,status:'blocked' as const,review_status:this.current(input.job_id).review.status,routing:decision};
-      this.seal(input.job_id);
       const previous=this.current(input.job_id);
       const repairing=previous.review.status==='changes_requested';
       const requirements=repairing?`${input.requirements}\n\nOriginal task (preserve its scope):\n${record.rounds[0]!.requirements}\n\nIndependent reviewer findings (validate each finding before repairing; explain any rejected finding with evidence):\n${previous.review.summary??''}`:input.requirements;
       const round=this.newRound(requirements,repairing?[...new Set([...record.rounds[0]!.acceptance,...input.acceptance])]:input.acceptance,this.project(record.projectId).path,record.rounds[0]);
+      this.seal(input.job_id);
       if(decision)round.routingDecision=decision;
       record.rounds.push(round);this.save();
       let result;
