@@ -6,7 +6,7 @@ import type { SourceSnapshot } from '../src/snapshot.js';
 
 const sha256=createHash('sha256').update(Buffer.from([0,1,2])).digest('hex');
 const blob='a'.repeat(40);
-const binary={path:'public/icon.png',reason:'binary_requires_separate_review',sha256,bytes:3,mode:'100644' as const,git_mode:'100644' as const,git_oid:blob};
+const binary={path:'public/icon.png',reason:'binary_requires_separate_review',sha256,bytes:3,mode:'100644' as const,git_mode:'100644' as const,git_oid:blob,head_git_mode:'100644' as const,head_git_oid:blob};
 const source:SourceSnapshot={head:'a'.repeat(40),files:{},omitted:[binary]};
 const scope:ScopeEvidence={declaration:{mode:'changes',base_commit:'a'.repeat(40),excluded_binary_assets:[{path:binary.path,reason:'Existing unchanged application icon, unrelated to the affected accounting behavior.'}],required_binary_paths:[]},excluded:[{path:binary.path,reason:'Existing unchanged application icon, unrelated to the affected accounting behavior.',sha256,bytes:3,git_mode:'100644',working_mode:'100644',git_blob_oid:blob}]};
 
@@ -31,6 +31,8 @@ test('only explicitly scoped unchanged hashed binary evidence is eligible',()=>{
   assert.throws(()=>assertReviewableOmissions(source,source,legacyScope),/lacks immutable evidence/);
   for(const omitted of [[],[{...binary,sha256:'b'.repeat(64)}],[{path:binary.path,reason:binary.reason}],[{...binary,reason:'non_utf8_requires_separate_review'}]])
     assert.throws(()=>assertReviewableOmissions(source,{...source,omitted},scope),/changed|evidence/);
+  for(const omitted of [{...binary,head_git_oid:'b'.repeat(40)},{...binary,head_git_mode:'100755'},(({head_git_oid:_,head_git_mode:__,...rest})=>rest)(binary)])
+    assert.throws(()=>assertReviewableOmissions(source,{...source,omitted:[omitted]},scope),/HEAD|evidence/);
 });
 
 test('a first followup scope binds only binary hash, size and mode matching the initial snapshot',()=>{
@@ -38,6 +40,8 @@ test('a first followup scope binds only binary hash, size and mode matching the 
   assert.throws(()=>assertScopeMatchesInitialSnapshot(scope,{...source,omitted:[{...binary,sha256:'b'.repeat(64)}]}),/changed since the initial baseline/);
   assert.throws(()=>assertScopeMatchesInitialSnapshot(scope,{...source,omitted:[{...binary,mode:'100755'}]}),/changed since the initial baseline/);
   assert.throws(()=>assertScopeMatchesInitialSnapshot(scope,{...source,omitted:[{...binary,git_oid:'b'.repeat(40)}]}),/changed since the initial baseline/);
+  assert.throws(()=>assertScopeMatchesInitialSnapshot(scope,{...source,omitted:[{...binary,head_git_oid:'b'.repeat(40)}]}),/changed since the initial baseline/);
+  assert.throws(()=>assertScopeMatchesInitialSnapshot(scope,{...source,omitted:[{...binary,head_git_mode:'100755'}]}),/changed since the initial baseline/);
   assert.throws(()=>assertScopeMatchesInitialSnapshot(scope,{...source,omitted:[{path:binary.path,reason:binary.reason,sha256,bytes:3}]}),/changed since the initial baseline/);
 });
 

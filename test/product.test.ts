@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmdirSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmdirSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import path from "node:path";
 import test from "node:test";
@@ -539,6 +539,57 @@ test('staged binary blob changed after scope capture blocks pass when worktree b
   await assert.rejects(f.product.review('staged-reviewer',reviewInput(result.job_id!,manifest,'reject-staged-after-capture')),/changed|separate review/i);
 });
 
+test('committed binary mutation cannot be hidden by restoring index and worktree before scope capture',async t=>{
+  const f=fixture(t);const input=scopedBinaryTask(f,'head-binary-before-dispatch');
+  writeFileSync(path.join(f.workspace,'icon.png'),Buffer.from([0,9]));
+  execFileSync('git',['add','icon.png'],{cwd:f.workspace,windowsHide:true});
+  execFileSync('git',['-c','user.name=Fixture','-c','user.email=fixture@example.invalid','-c','core.hooksPath=.no-test-hooks','commit','-m','Committed binary change'],{cwd:f.workspace,windowsHide:true,stdio:'pipe'});
+  writeFileSync(path.join(f.workspace,'icon.png'),Buffer.from([0,1,2,3]));
+  execFileSync('git',['add','icon.png'],{cwd:f.workspace,windowsHide:true});
+  await assertScopeSubmitJournalState(f,input,'FAILED');
+});
+
+test('committed deletion cannot be hidden by restoring index and worktree before scope capture',async t=>{
+  const f=fixture(t);const input=scopedBinaryTask(f,'head-binary-delete-before-dispatch');
+  execFileSync('git',['rm','icon.png'],{cwd:f.workspace,windowsHide:true,stdio:'pipe'});
+  execFileSync('git',['-c','user.name=Fixture','-c','user.email=fixture@example.invalid','-c','core.hooksPath=.no-test-hooks','commit','-m','Committed binary deletion'],{cwd:f.workspace,windowsHide:true,stdio:'pipe'});
+  writeFileSync(path.join(f.workspace,'icon.png'),Buffer.from([0,1,2,3]));execFileSync('git',['add','icon.png'],{cwd:f.workspace,windowsHide:true});
+  await assertScopeSubmitJournalState(f,input,'FAILED');
+});
+
+test('committed binary mutation cannot be hidden by restoring index and worktree before final review',async t=>{
+  const f=fixture(t);const result=await f.product.submit(scopedBinaryTask(f,'head-binary-before-review'));
+  writeFileSync(path.join(f.workspace,'icon.png'),Buffer.from([0,9]));
+  execFileSync('git',['add','icon.png'],{cwd:f.workspace,windowsHide:true});
+  execFileSync('git',['-c','user.name=Fixture','-c','user.email=fixture@example.invalid','-c','core.hooksPath=.no-test-hooks','commit','-m','Committed binary change'],{cwd:f.workspace,windowsHide:true,stdio:'pipe'});
+  writeFileSync(path.join(f.workspace,'icon.png'),Buffer.from([0,1,2,3]));
+  execFileSync('git',['add','icon.png'],{cwd:f.workspace,windowsHide:true});
+  f.fake.complete(result.thread_id!,result.turn_id!,f.workspace);
+  const manifest=f.product.seal(result.job_id!);readAll(f.product,'head-binary-reviewer',manifest);
+  await assert.rejects(f.product.review('head-binary-reviewer',reviewInput(result.job_id!,manifest,'reject-head-binary-mutation')),/HEAD|changed|separate review/i);
+  assert.equal(f.product.status(result.job_id!).review_status,'pending_chatgpt_review');
+});
+
+test('committed executable-mode mutation cannot be hidden by restoring index and worktree before capture',async t=>{
+  if(process.platform==='win32'){t.skip('Windows does not expose Git executable-mode changes through chmod consistently.');return;}
+  const f=fixture(t);const input=scopedBinaryTask(f,'head-binary-mode-before-dispatch');const icon=path.join(f.workspace,'icon.png');
+  chmodSync(icon,0o755);execFileSync('git',['add','icon.png'],{cwd:f.workspace,windowsHide:true});
+  execFileSync('git',['-c','user.name=Fixture','-c','user.email=fixture@example.invalid','-c','core.hooksPath=.no-test-hooks','commit','-m','Committed executable mode'],{cwd:f.workspace,windowsHide:true,stdio:'pipe'});
+  chmodSync(icon,0o644);execFileSync('git',['add','icon.png'],{cwd:f.workspace,windowsHide:true});
+  await assertScopeSubmitJournalState(f,input,'FAILED');
+});
+
+test('committed executable-mode mutation cannot be hidden by restoring index and worktree before final review',async t=>{
+  if(process.platform==='win32'){t.skip('Windows does not expose Git executable-mode changes through chmod consistently.');return;}
+  const f=fixture(t);const result=await f.product.submit(scopedBinaryTask(f,'head-binary-mode-before-review'));const icon=path.join(f.workspace,'icon.png');
+  chmodSync(icon,0o755);execFileSync('git',['add','icon.png'],{cwd:f.workspace,windowsHide:true});
+  execFileSync('git',['-c','user.name=Fixture','-c','user.email=fixture@example.invalid','-c','core.hooksPath=.no-test-hooks','commit','-m','Committed executable mode'],{cwd:f.workspace,windowsHide:true,stdio:'pipe'});
+  chmodSync(icon,0o644);execFileSync('git',['add','icon.png'],{cwd:f.workspace,windowsHide:true});
+  f.fake.complete(result.thread_id!,result.turn_id!,f.workspace);
+  const manifest=f.product.seal(result.job_id!);readAll(f.product,'head-mode-reviewer',manifest);
+  await assert.rejects(f.product.review('head-mode-reviewer',reviewInput(result.job_id!,manifest,'reject-head-binary-mode')),/HEAD|changed|separate review/i);
+});
+
 test('first trusted change scope can bind on followup when excluded binaries match the initial snapshot',async t=>{
   const f=fixture(t);const input=scopedBinaryTask(f,'late-scope-binding');
   input.requirements=input.requirements.slice(input.requirements.indexOf('\n')+1);
@@ -674,6 +725,14 @@ test('unmerged binary index without stage zero cannot be excluded',async t=>{
   await assertScopeSubmitJournalState(f,input,'FAILED');
 });
 
+test('binary path typechange to a symlink cannot be excluded',async t=>{
+  if(process.platform==='win32'){t.skip('Windows symlink creation is not consistently available in the fixture environment.');return;}
+  const f=fixture(t);const input=scopedBinaryTask(f,'binary-typechange');
+  unlinkSync(path.join(f.workspace,'icon.png'));symlinkSync('source.ts',path.join(f.workspace,'icon.png'));
+  execFileSync('git',['add','icon.png'],{cwd:f.workspace,windowsHide:true});
+  await assertScopeSubmitJournalState(f,input,'FAILED');
+});
+
 test('legacy omitted binary state without hashes cannot acquire a pass after restart',async t=>{
   const f=fixture(t);const result=await f.product.submit(scopedBinaryTask(f,'legacy-binary'));
   f.fake.complete(result.thread_id!,result.turn_id!,f.workspace);
@@ -689,4 +748,16 @@ test('legacy omitted binary state without hashes cannot acquire a pass after res
   f.fake.complete(next.thread_id!,next.turn_id!,f.workspace);
   const resumed=new AutoDev(f.config,f.manager);const resumedManifest=resumed.seal(result.job_id!);readAll(resumed,'reviewer',resumedManifest);
   await assert.rejects(resumed.review('reviewer',reviewInput(result.job_id!,resumedManifest,'reject-legacy-followup')),/separate review/);
+});
+
+test('restart with missing HEAD-tree exclusion evidence cannot pass review',async t=>{
+  const f=fixture(t);const result=await f.product.submit(scopedBinaryTask(f,'missing-head-evidence-after-restart'));
+  f.fake.complete(result.thread_id!,result.turn_id!,f.workspace);
+  const manifest=f.product.seal(result.job_id!);readAll(f.product,'missing-head-reviewer',manifest);
+  const filename=path.join(f.runtimeDir,'product-state.json');const envelope=JSON.parse(readFileSync(filename,'utf8'));
+  const omitted=envelope.state.records[0].rounds[0].before.omitted.find((item:{path:string})=>item.path==='icon.png');
+  delete omitted.head_git_mode;delete omitted.head_git_oid;
+  envelope.checksum=createHash('sha256').update(JSON.stringify(envelope.state)).digest('hex');writeFileSync(filename,JSON.stringify(envelope));
+  const restarted=new AutoDev(f.config,f.manager);readAll(restarted,'missing-head-reviewer',manifest);
+  await assert.rejects(restarted.review('missing-head-reviewer',reviewInput(result.job_id!,manifest,'reject-missing-head-evidence')),/HEAD|changed|separate review/i);
 });
