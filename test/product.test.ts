@@ -497,6 +497,20 @@ test('changed, new and deleted binary assets remain blocking in a declared chang
   }
 });
 
+test('continued rounds retain the original binary review baseline',async t=>{
+  const f=fixture(t);const result=await f.product.submit(scopedBinaryTask(f,'cumulative-binary-baseline'));
+  writeFileSync(path.join(f.workspace,'icon.png'),Buffer.from([0,9]));
+  writeFileSync(path.join(f.workspace,'source.ts'),'export const value = 2;\n');
+  f.fake.complete(result.thread_id!,result.turn_id!,f.workspace);
+  const firstManifest=f.product.seal(result.job_id!);readAll(f.product,'binary-reviewer',firstManifest);
+  await f.product.review('binary-reviewer',{...reviewInput(result.job_id!,firstManifest,'binary-finding'),verdict:'changes_requested',summary:'The source change needs one more focused regression.'});
+
+  const next=await f.product.continue({request_key:'cumulative-binary-repair',job_id:result.job_id!,requirements:'Add the requested focused regression.',acceptance:['The focused regression passes.']});
+  f.fake.complete(next.thread_id!,next.turn_id!,f.workspace);
+  const nextManifest=f.product.seal(result.job_id!);readAll(f.product,'binary-reviewer',nextManifest);
+  await assert.rejects(f.product.review('binary-reviewer',{...reviewInput(result.job_id!,nextManifest,'cumulative-binary-pass'),summary:'The focused regression passes and source review is complete.'}),/changed|separate review/i);
+});
+
 test('binary modified before dispatch cannot hide behind the current task baseline',async t=>{
   const f=fixture(t);const input=scopedBinaryTask(f,'preexisting-binary-change');
   writeFileSync(path.join(f.workspace,'icon.png'),Buffer.from([0,9]));

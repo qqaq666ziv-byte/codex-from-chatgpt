@@ -117,9 +117,12 @@ export class AutoDev {
     await this.jobs.initialize();
     if(this.jobs.list().some(job=>active.has(job.status)))throw new Error('Executor is busy or requires recovery; no task round was changed.');
   }
-  private newRound(requirements:string,acceptance:string[],workspace:string):Round {
+  private newRound(requirements:string,acceptance:string[],workspace:string,baseline?:Round):Round {
     const before=this.snapshot(workspace);
-    const reviewScope=captureReviewScope(workspace,parseReviewScope(requirements),before);
+    const declaredScope=parseReviewScope(requirements);
+    if(baseline&&declaredScope&&JSON.stringify(declaredScope)!==JSON.stringify(baseline.reviewScope?.declaration))
+      throw new Error('A continued review cannot change the original pinned review scope.');
+    const reviewScope=baseline?baseline.reviewScope:captureReviewScope(workspace,declaredScope,before);
     return {requirements,acceptance,before,...(reviewScope?{reviewScope}:{}),turnId:null,manifestId:null,afterHash:null,executionHash:null,review:{status:'pending_chatgpt_review'}};
   }
   private prompt(round:Round):string {
@@ -159,7 +162,7 @@ export class AutoDev {
       const previous=this.current(input.job_id);
       const repairing=previous.review.status==='changes_requested';
       const requirements=repairing?`${input.requirements}\n\nOriginal task (preserve its scope):\n${record.rounds[0]!.requirements}\n\nIndependent reviewer findings (validate each finding before repairing; explain any rejected finding with evidence):\n${previous.review.summary??''}`:input.requirements;
-      const round=this.newRound(requirements,repairing?[...new Set([...record.rounds[0]!.acceptance,...input.acceptance])]:input.acceptance,this.project(record.projectId).path);
+      const round=this.newRound(requirements,repairing?[...new Set([...record.rounds[0]!.acceptance,...input.acceptance])]:input.acceptance,this.project(record.projectId).path,record.rounds[0]);
       if(decision)round.routingDecision=decision;
       record.rounds.push(round);this.save();
       let result;
@@ -230,7 +233,7 @@ export class AutoDev {
   }
   forgetSession(session:string) {for(const key of this.receipts.keys())if(key.startsWith(`${session}:`))this.receipts.delete(key);}
   private reviewPreflight(session:string,input:ReviewInput) {
-      const round=this.current(input.job_id);
+      const record=this.record(input.job_id);const round=record.rounds.at(-1)!;
       if(!round.manifestId)throw new Error('Seal the current evidence manifest and read all artifacts before recording review.');
       const manifest=this.seal(input.job_id);
       if(round.manifestId!==input.manifest_id||manifest.id!==input.manifest_id)throw new Error('Stale evidence revision.');
@@ -243,7 +246,7 @@ export class AutoDev {
       if(input.verdict==='pass') {
         const execution=this.jobs.evidence(input.job_id);
         if(execution.status!=='completed')throw new Error('Only completed execution may pass review.');
-        assertReviewableOmissions(round.before,after,round.reviewScope);
+        assertReviewableOmissions(record.rounds[0]!.before,after,record.rounds[0]!.reviewScope);
         const tests=execution.validation.filter(item=>item.kind==='test');
         const applicable=tests.length?execution.validation:round.routingDecision?.requested.verification?execution.validation:tests;
         const latest=new Map(applicable.map(item=>[`${item.kind}:${item.command}`,item]));
